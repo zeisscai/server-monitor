@@ -1,0 +1,45 @@
+{{template "head" .}}
+<body class="app">
+{{template "nav" .}}
+<main class="wrap">
+  <div class="page-head">
+    <div>
+      <h1>服务器面板</h1>
+      <p class="muted">共 <strong id="srv-count">{{len .Servers}}</strong> 台服务器 · 每 5 秒自动刷新</p>
+    </div>
+    <div class="head-actions">
+      <span class="pill"><i class="dot dot-ok"></i> 运行中</span>
+      <button class="btn" id="refresh-btn">立即刷新</button>
+    </div>
+  </div>
+
+  <section class="grid" id="grid">
+    {{range .Servers}}
+    <a class="srv-card" href="/server/{{.ServerUUID}}" data-uuid="{{.ServerUUID}}">
+      <div class="srv-head">
+        <span class="srv-name" title="{{.ServerName}}">{{.ServerName}}</span>
+        {{if .IsSelf}}<span class="badge badge-self">本机</span>{{else}}<span class="badge badge-remote">外来上报</span>{{end}}
+      </div>
+      <div class="metric">
+        <span class="metric-label">CPU 占用</span>
+        <span class="metric-val">{{pct .CPU}}%</span>
+      </div>
+      <div class="bar"><i class="fill" data-level="{{level .CPU}}" style="width:{{pct .CPU}}%"></i></div>
+      <div class="metric">
+        <span class="metric-label">内存占用</span>
+        <span class="metric-val">{{pct .Mem}}%</span>
+      </div>
+      <div class="bar"><i class="fill" data-level="{{level .Mem}}" style="width:{{pct .Mem}}%"></i></div>
+      <div class="srv-foot">
+        <span class="muted" data-ts="{{.CreatedAt}}">更新于 {{ts .CreatedAt}}</span>
+        <span class="chev">›</span>
+      </div>
+    </a>
+    {{end}}
+  </section>
+
+  <div class="empty" id="grid-empty" {{if .Servers}}hidden{{end}}>
+    <p>暂无数据，采集开始后将自动显示。</p>
+  </div>
+</main>
+{{template "foot" .}}

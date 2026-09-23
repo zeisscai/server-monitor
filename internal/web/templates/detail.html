@@ -1,0 +1,62 @@
+{{template "head" .}}
+<body class="app">
+{{template "nav" .}}
+<main class="wrap">
+  <div class="page-head">
+    <div>
+      <a class="back" href="/">← 返回面板</a>
+      <h1>{{.Name}}{{if .IsSelf}} <span class="badge badge-self">本机</span>{{end}}</h1>
+      <p class="muted mono">{{.UUID}}</p>
+    </div>
+  </div>
+
+  <div class="range-bar">
+    <button class="range" data-range="1h">最近 1 小时</button>
+    <button class="range" data-range="24h">最近 24 小时</button>
+    <button class="range" data-range="7d">最近 7 天</button>
+    <button class="range active" data-range="30d">最近 1 个月</button>
+    <button class="range" data-range="custom">自定义</button>
+    <span class="range-note muted" id="range-note"></span>
+  </div>
+
+  <div class="custom-range" id="custom-range" hidden>
+    <label>开始<input type="datetime-local" id="range-from"></label>
+    <label>结束<input type="datetime-local" id="range-to"></label>
+    <button class="btn btn-primary" id="range-apply">查询</button>
+  </div>
+
+  <section class="card chart-card">
+    <div class="card-head">
+      <h2>CPU / 内存趋势</h2>
+      <div class="legend">
+        <span><i class="sw sw-cpu"></i>CPU</span>
+        <span><i class="sw sw-mem"></i>内存</span>
+      </div>
+    </div>
+    <div class="chart-box" id="chart-box">
+      <canvas id="chart" height="320"></canvas>
+      <div class="tooltip" id="chart-tip" hidden></div>
+    </div>
+    <div class="empty" id="chart-empty" hidden>该时间范围内暂无数据</div>
+  </section>
+
+  <section class="stats" id="stats"></section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>历史记录</h2>
+      <span class="muted" id="records-note"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr><th>时间</th><th>CPU 占用</th><th>内存占用</th><th>数据来源</th></tr>
+        </thead>
+        <tbody id="records-body"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="records-empty" hidden>暂无历史记录</div>
+  </section>
+</main>
+{{template "foot" .}}
+<div id="detail-meta" data-uuid="{{.UUID}}" data-self="{{.IsSelf}}" hidden></div>

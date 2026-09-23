@@ -1,0 +1,133 @@
+{{template "head" .}}
+<body class="app">
+{{template "nav" .}}
+<main class="wrap">
+  <div class="page-head">
+    <div>
+      <h1>设置</h1>
+      <p class="muted">数据接收与数据上报各自独立，互不影响。</p>
+    </div>
+  </div>
+
+  {{if .Saved}}<div class="alert alert-ok">设置已保存并生效。</div>{{end}}
+  {{if .ErrorMsg}}<div class="alert alert-error">{{.ErrorMsg}}</div>{{end}}
+
+  <form method="post" action="/settings" class="settings-form">
+
+    <section class="card">
+      <div class="card-head">
+        <h2>基础信息</h2>
+      </div>
+      <div class="form-grid">
+        <label class="field">
+          <span>服务器名称</span>
+          <input type="text" name="server_name" value="{{.Cfg.ServerName}}" maxlength="64" placeholder="本机在面板中的显示名称">
+          <em class="hint">本机在面板中的显示名称</em>
+        </label>
+        <label class="field">
+          <span>本机识别码（UUID）</span>
+          <input type="text" class="mono" value="{{.Cfg.UUID}}" readonly>
+          <em class="hint">首次启动自动生成，只读，用于区分重名服务器</em>
+        </label>
+        <label class="field">
+          <span>Web 监听端口</span>
+          <input type="text" value="{{.Cfg.WebPort}}" readonly>
+          <em class="hint">修改方式：部署脚本中重新设置，或用 --web-port 参数启动后重启服务</em>
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>数据接收
+          {{if .Cfg.ReceiveEnabled}}<span class="pill pill-ok"><i class="dot dot-ok"></i> 已开启{{if gt .Listening 0}} · 监听 {{.Listening}}{{end}}</span>
+          {{else}}<span class="pill"><i class="dot dot-off"></i> 已关闭</span>{{end}}
+        </h2>
+        <label class="switch">
+          <input type="checkbox" name="receive_enabled" id="receive_enabled" {{if .Cfg.ReceiveEnabled}}checked{{end}}>
+          <span class="slider"></span>
+        </label>
+      </div>
+      <p class="muted section-desc">关闭时（默认）不接收任何外部上报数据，也不会开放对外端口。</p>
+
+      <div class="form-grid dep" data-dep="receive">
+        <label class="field">
+          <span>数据接收端口</span>
+          <input type="number" name="receive_port" min="1" max="65535" value="{{.Cfg.ReceivePort}}">
+          <em class="hint">其他服务器向本机上报数据时使用的端口</em>
+        </label>
+
+        <div class="field">
+          <span>接收 API-Key</span>
+          {{if .Cfg.ReceiveAPIKey}}
+          <div class="copy-row">
+            <input type="text" id="receive-key" class="mono" value="{{.Cfg.ReceiveAPIKey}}" readonly>
+            <button type="button" class="btn" data-copy="receive-key">复制</button>
+          </div>
+          <em class="hint">18 位，开启该功能时自动生成；请把它填写到上报端的「上报 API-Key」</em>
+          {{else}}
+          <input type="text" id="receive-key" class="mono" value="" placeholder="开启并保存后自动生成" readonly>
+          <em class="hint">开启该功能并保存后，将自动生成一个 18 位 API-Key</em>
+          {{end}}
+        </div>
+
+        <div class="field">
+          <span>数据库占用</span>
+          {{if .HasDBSz}}
+          <input type="text" value="{{size .DBSize}}" readonly>
+          <em class="hint">SQLite 历史数据永久保留，不做清理</em>
+          {{else}}
+          <input type="text" value="—" readonly>
+          <em class="hint">开启数据接收后显示</em>
+          {{end}}
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>数据上报
+          {{if .Cfg.ReportEnabled}}<span class="pill pill-ok"><i class="dot dot-ok"></i> 已开启 · 每 {{.Cfg.ReportInterval}} 秒</span>
+          {{else}}<span class="pill"><i class="dot dot-off"></i> 已关闭</span>{{end}}
+        </h2>
+        <label class="switch">
+          <input type="checkbox" name="report_enabled" id="report_enabled" {{if .Cfg.ReportEnabled}}checked{{end}}>
+          <span class="slider"></span>
+        </label>
+      </div>
+      <p class="muted section-desc">开启后按设定频率向目标服务器上报本机 UUID、名称、CPU 与内存占用；采集频率与上报频率一致，关闭时按 5 秒采集。</p>
+
+      <div class="form-grid dep" data-dep="report">
+        <label class="field">
+          <span>上报目标服务器 IP</span>
+          <input type="text" name="report_target_ip" value="{{.Cfg.ReportTargetIP}}" placeholder="例如 192.168.1.10">
+          <em class="hint">面板服务器的地址{{if .IPs}}；本机地址：{{range $i, $ip := .IPs}}{{if $i}}、{{end}}{{$ip}}{{end}}{{end}}</em>
+        </label>
+        <label class="field">
+          <span>上报目标服务器端口</span>
+          <input type="number" name="report_target_port" min="1" max="65535" value="{{if .Cfg.ReportTargetPort}}{{.Cfg.ReportTargetPort}}{{end}}" placeholder="例如 9100">
+          <em class="hint">目标服务器「数据接收端口」</em>
+        </label>
+        <label class="field">
+          <span>上报频率</span>
+          <select name="report_interval">
+            <option value="2" {{if eq .Cfg.ReportInterval 2}}selected{{end}}>2 秒</option>
+            <option value="5" {{if eq .Cfg.ReportInterval 5}}selected{{end}}>5 秒</option>
+            <option value="10" {{if eq .Cfg.ReportInterval 10}}selected{{end}}>10 秒</option>
+          </select>
+          <em class="hint">同时决定本机采集频率</em>
+        </label>
+        <label class="field">
+          <span>上报 API-Key</span>
+          <input type="text" class="mono" name="report_api_key" value="{{.Cfg.ReportAPIKey}}" placeholder="目标服务器生成的接收 Key">
+          <em class="hint">填写目标服务器「接收 API-Key」</em>
+        </label>
+      </div>
+    </section>
+
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">保存设置</button>
+    </div>
+  </form>
+</main>
+{{template "foot" .}}

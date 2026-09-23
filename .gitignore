@@ -1,0 +1,28 @@
+# ---- 构建产物（由 build.sh 生成，可随时重建）----
+/dist/
+
+# ---- 运行时数据（含明文账号密码与 SQLite 数据库，严禁入库）----
+/config.json
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ---- 本地工作区数据（AI 记忆与笔记，含内部决策记录，不公开）----
+.workbuddy/
+
+# ---- macOS ----
+.DS_Store
+._*
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- 日志与临时文件 ----
+*.log
+tmp/

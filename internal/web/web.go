@@ -1,0 +1,524 @@
+// Package web 提供 Web 登录、面板、服务器详情与设置页。
+package web
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"embed"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"io/fs"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"server-monitor/internal/config"
+	"server-monitor/internal/engine"
+	"server-monitor/internal/store"
+)
+
+//go:embed templates/*.html
+var tmplFS embed.FS
+
+//go:embed static/*
+var staticFS embed.FS
+
+const sessionCookie = "smd_session"
+
+// Server 承载 Web 服务。
+type Server struct {
+	cfg  *config.Manager
+	st   *store.Store
+	eng  *engine.Engine
+	tmpl *template.Template
+}
+
+// New 构建 Web 服务。
+func New(cfg *config.Manager, st *store.Store, eng *engine.Engine) (*Server, error) {
+	t, err := template.New("").Funcs(template.FuncMap{
+		"pct": func(v float64) string { return strconv.FormatFloat(v, 'f', 1, 64) },
+		"ts": func(ms int64) string {
+			if ms == 0 {
+				return "-"
+			}
+			return time.UnixMilli(ms).Format("2006-01-02 15:04:05")
+		},
+		"level": Level,
+		"size":  HumanSize,
+	}).ParseFS(tmplFS, "templates/*.html")
+	if err != nil {
+		return nil, fmt.Errorf("解析页面模板失败: %w", err)
+	}
+	return &Server{cfg: cfg, st: st, eng: eng, tmpl: t}, nil
+}
+
+// Handler 返回 Web 路由。
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	staticRoot, err := fs.Sub(staticFS, "static")
+	if err != nil {
+		panic(err)
+	}
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(staticRoot)))
+
+	mux.HandleFunc("GET /login", s.handleLoginPage)
+	mux.HandleFunc("POST /login", s.handleLoginPost)
+	mux.HandleFunc("GET /logout", s.handleLogout)
+
+	mux.HandleFunc("GET /{$}", s.auth(s.handlePanel))
+	mux.HandleFunc("GET /server/{uuid}", s.auth(s.handleDetail))
+	mux.HandleFunc("GET /settings", s.auth(s.handleSettings))
+	mux.HandleFunc("POST /settings", s.auth(s.handleSettingsSave))
+	mux.HandleFunc("GET /api/overview", s.auth(s.handleOverview))
+	mux.HandleFunc("GET /api/history", s.auth(s.handleHistory))
+
+	return securityHeaders(mux)
+}
+
+// Run 启动 Web 服务并在 ctx 结束时优雅关闭。
+func (s *Server) Run(ctx context.Context) error {
+	c := s.cfg.Snapshot()
+	addr := fmt.Sprintf(":%d", c.WebPort)
+
+	// 先显式监听再交给 http.Server：这样端口被占用时能得到可读的错误原因，
+	// 而不是只在 systemd 日志里留下一句 "listen tcp ... bind"。
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		hint := "可能已被其它程序占用"
+		if c.WebPort < 1024 {
+			hint += "，或该端口小于 1024 而服务不是以 root 运行"
+		}
+		return fmt.Errorf("Web 端口 %d 无法监听（%s）：%v", c.WebPort, hint, err)
+	}
+
+	srv := &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	return srv.Serve(ln)
+}
+
+// ---------- 认证 ----------
+
+func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.currentUser(r); !ok {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) currentUser(r *http.Request) (string, bool) {
+	ck, err := r.Cookie(sessionCookie)
+	if err != nil || ck.Value == "" {
+		return "", false
+	}
+	return s.verifyToken(ck.Value)
+}
+
+func (s *Server) sign(user string, exp int64) string {
+	c := s.cfg.Snapshot()
+	payload := user + "|" + strconv.FormatInt(exp, 10)
+	mac := hmac.New(sha256.New, []byte(c.SessionSecret))
+	mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Server) verifyToken(token string) (string, bool) {
+	raw, sig, ok := strings.Cut(token, ".")
+	if !ok {
+		return "", false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return "", false
+	}
+	c := s.cfg.Snapshot()
+	mac := hmac.New(sha256.New, []byte(c.SessionSecret))
+	mac.Write(payload)
+	want := hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(want), []byte(sig)) {
+		return "", false
+	}
+	user, expStr, ok := strings.Cut(string(payload), "|")
+	if !ok {
+		return "", false
+	}
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil || time.Now().Unix() > exp {
+		return "", false
+	}
+	if user != s.cfg.Snapshot().WebUser {
+		return "", false
+	}
+	return user, true
+}
+
+func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.currentUser(r); ok {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	s.render(w, "login.html", map[string]any{
+		"Title":     "登录",
+		"Error":     r.URL.Query().Get("error"),
+		"Hostname":  s.cfg.Snapshot().ServerName,
+		"RequestID": time.Now().UnixNano(),
+	})
+}
+
+func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	user := strings.TrimSpace(r.FormValue("username"))
+	pass := r.FormValue("password")
+	c := s.cfg.Snapshot()
+
+	if subtleEqual(user, c.WebUser) && subtleEqual(pass, c.WebPass) && c.WebPass != "" {
+		exp := time.Now().Add(7 * 24 * time.Hour).Unix()
+		http.SetCookie(w, &http.Cookie{
+			Name:     sessionCookie,
+			Value:    s.sign(user, exp),
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   7 * 24 * 3600,
+		})
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	// 轻微延时，降低暴力破解效率。
+	time.Sleep(400 * time.Millisecond)
+	http.Redirect(w, r, "/login?error="+urlEncode("账号或密码错误"), http.StatusFound)
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+// ---------- 页面 ----------
+
+type baseData struct {
+	Title  string
+	Cfg    config.Config
+	Active string
+}
+
+func (s *Server) base(title, active string) baseData {
+	return baseData{Title: title, Cfg: s.cfg.Snapshot(), Active: active}
+}
+
+func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
+	c := s.cfg.Snapshot()
+	latest, err := s.st.Latest()
+	if err != nil {
+		http.Error(w, "查询失败", http.StatusInternalServerError)
+		return
+	}
+	type view struct {
+		store.Latest
+		IsSelf bool
+	}
+	servers := make([]view, 0, len(latest))
+	for _, l := range latest {
+		servers = append(servers, view{Latest: l, IsSelf: l.ServerUUID == c.UUID})
+	}
+	s.render(w, "panel.html", struct {
+		baseData
+		Servers []view
+	}{s.base("面板", "panel"), servers})
+}
+
+func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
+	uuid := r.PathValue("uuid")
+	c := s.cfg.Snapshot()
+
+	name, err := s.st.Name(uuid)
+	if err != nil {
+		http.Error(w, "查询失败", http.StatusInternalServerError)
+		return
+	}
+	if name == "" {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	s.render(w, "detail.html", struct {
+		baseData
+		UUID   string
+		Name   string
+		IsSelf bool
+	}{s.base(name, "panel"), uuid, name, uuid == c.UUID})
+}
+
+type settingsData struct {
+	baseData
+	Saved     bool
+	ErrorMsg  string
+	DBSize    int64
+	HasDBSz   bool
+	Listening int
+	IPs       []string
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	s.renderSettings(w, r, "", r.URL.Query().Get("saved") == "1")
+}
+
+func (s *Server) renderSettings(w http.ResponseWriter, r *http.Request, errMsg string, saved bool) {
+	c := s.cfg.Snapshot()
+	data := settingsData{
+		baseData:  s.base("设置", "settings"),
+		Saved:     saved,
+		ErrorMsg:  errMsg,
+		Listening: s.eng.Running(),
+		IPs:       LocalIPs(),
+	}
+	if c.ReceiveEnabled {
+		if n, err := s.st.Size(); err == nil {
+			data.DBSize, data.HasDBSz = n, true
+		}
+	}
+	s.render(w, "settings.html", data)
+}
+
+func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.renderSettings(w, r, "表单解析失败", false)
+		return
+	}
+	_, err := s.cfg.Update(func(c *config.Config) {
+		c.ServerName = strings.TrimSpace(r.FormValue("server_name"))
+
+		c.ReceiveEnabled = r.FormValue("receive_enabled") != ""
+		// 关闭功能时对应输入框不会随表单提交，此处仅在字段存在时更新，保留原值。
+		if _, ok := r.Form["receive_port"]; ok {
+			if p, e := strconv.Atoi(strings.TrimSpace(r.FormValue("receive_port"))); e == nil {
+				c.ReceivePort = p
+			}
+		}
+
+		c.ReportEnabled = r.FormValue("report_enabled") != ""
+		if _, ok := r.Form["report_target_ip"]; ok {
+			c.ReportTargetIP = strings.TrimSpace(r.FormValue("report_target_ip"))
+		}
+		if _, ok := r.Form["report_target_port"]; ok {
+			if p, e := strconv.Atoi(strings.TrimSpace(r.FormValue("report_target_port"))); e == nil {
+				c.ReportTargetPort = p
+			}
+		}
+		if _, ok := r.Form["report_interval"]; ok {
+			if iv, e := strconv.Atoi(strings.TrimSpace(r.FormValue("report_interval"))); e == nil {
+				c.ReportInterval = iv
+			}
+		}
+		if _, ok := r.Form["report_api_key"]; ok {
+			c.ReportAPIKey = strings.TrimSpace(r.FormValue("report_api_key"))
+		}
+	})
+	if err != nil {
+		s.renderSettings(w, r, err.Error(), false)
+		return
+	}
+	// 配置变更会触发 engine 的热重启回调（见 main.go 中的 OnChange 注册）。
+	http.Redirect(w, r, "/settings?saved=1", http.StatusFound)
+}
+
+// ---------- 接口 ----------
+
+func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
+	latest, err := s.st.Latest()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "查询失败"})
+		return
+	}
+	c := s.cfg.Snapshot()
+	type item struct {
+		store.Latest
+		IsSelf bool `json:"is_self"`
+	}
+	items := make([]item, 0, len(latest))
+	for _, l := range latest {
+		items = append(items, item{Latest: l, IsSelf: l.ServerUUID == c.UUID})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"self":     c.UUID,
+		"selfName": c.ServerName,
+		"now":      time.Now().UnixMilli(),
+		"servers":  items,
+	})
+}
+
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	uuid := q.Get("uuid")
+	if !config.IsUUID(uuid) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "服务器识别码不合法"})
+		return
+	}
+	now := time.Now()
+	to := parseMs(q.Get("to"), now.UnixMilli())
+	from := parseMs(q.Get("from"), now.AddDate(0, -1, 0).UnixMilli())
+	if from > to {
+		from, to = to, from
+	}
+
+	points, err := s.st.Series(uuid, from, to, 720)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "查询失败"})
+		return
+	}
+	records, err := s.st.History(uuid, from, to, 200)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "查询失败"})
+		return
+	}
+	stat, err := s.st.Stat(uuid, from, to)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "查询失败"})
+		return
+	}
+	name, _ := s.st.Name(uuid)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"uuid":    uuid,
+		"name":    name,
+		"from":    from,
+		"to":      to,
+		"is_self": uuid == s.cfg.Snapshot().UUID,
+		"points":  points,
+		"records": records,
+		"stats":   stat,
+	})
+}
+
+// ---------- 工具 ----------
+
+func (s *Server) render(w http.ResponseWriter, name string, data any) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
+		http.Error(w, "页面渲染失败", http.StatusInternalServerError)
+	}
+}
+
+func writeJSON(w http.ResponseWriter, code int, body any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "same-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func parseMs(v string, def int64) int64 {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return n
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, v, time.Local); err == nil {
+			return t.UnixMilli()
+		}
+	}
+	return def
+}
+
+func subtleEqual(a, b string) bool {
+	return hmac.Equal([]byte(a), []byte(b))
+}
+
+func urlEncode(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, " ", "%20"), "&", "%26")
+}
+
+// LocalIPs 返回本机非回环 IPv4 地址，用于在设置页提示上报时应填写的 IP。
+func LocalIPs() []string {
+	var out []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return out
+	}
+	for _, ifi := range ifaces {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipnet.IP.To4()
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			out = append(out, ip.String())
+		}
+	}
+	return out
+}
+
+// ---------- 视图辅助 ----------
+
+// Level 依据占用率返回展示等级，用于进度条配色。
+func Level(v float64) string {
+	switch {
+	case v >= 85:
+		return "danger"
+	case v >= 60:
+		return "warn"
+	default:
+		return "ok"
+	}
+}
+
+// HumanSize 把字节数格式化为易读字符串。
+func HumanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
+	v := float64(n)
+	i := -1
+	for v >= unit && i < len(units)-1 {
+		v /= unit
+		i++
+	}
+	digits := 1
+	if v >= 100 {
+		digits = 0
+	}
+	return strconv.FormatFloat(v, 'f', digits, 64) + " " + units[i]
+}

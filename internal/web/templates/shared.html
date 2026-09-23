@@ -1,0 +1,27 @@
+{{define "head"}}<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>{{.Title}} · 服务器监控</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>{{end}}
+
+{{define "nav"}}<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="brand" href="/">
+      <span class="brand-dot"></span>
+      <span class="brand-name">服务器监控</span>
+    </a>
+    <nav class="nav">
+      <a href="/" class="{{if eq .Active "panel"}}active{{end}}">面板</a>
+      <a href="/settings" class="{{if eq .Active "settings"}}active{{end}}">设置</a>
+      <a href="/logout" class="logout">退出</a>
+    </nav>
+  </div>
+</header>{{end}}
+
+{{define "foot"}}<script src="/static/app.js"></script>
+</body>
+</html>{{end}}
