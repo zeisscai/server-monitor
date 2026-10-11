@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 type harness struct {
 	cfg *config.Manager
 	st  *store.Store
+	ws  *Server
 	srv *httptest.Server
 }
 
@@ -60,7 +62,7 @@ func newHarness(t *testing.T) *harness {
 	srv := httptest.NewServer(ws.Handler())
 	t.Cleanup(srv.Close)
 
-	return &harness{cfg: cfg, st: st, srv: srv}
+	return &harness{cfg: cfg, st: st, ws: ws, srv: srv}
 }
 
 func loginClient(t *testing.T, baseURL, user, pass string) (*http.Client, *http.Response) {
@@ -468,6 +470,103 @@ func TestDetailPage(t *testing.T) {
 			t.Fatalf("详情页缺少元素 %q", want)
 		}
 	}
+}
+
+// 登录限流端到端：确认 handler 真的把失败记进了限流器，被拦时返回 429，
+// 且退避结束后能自动恢复（不做硬锁定）。
+func TestLoginThrottleEndToEnd(t *testing.T) {
+	h := newHarness(t)
+
+	// 注入可控时钟，避免测试真的等待 15 分钟退避。用互斥锁保护，
+	// 因为 handler 在自己的 goroutine 里读取该时钟。
+	var mu sync.Mutex
+	cur := time.Now()
+	h.ws.lim.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return cur
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		cur = cur.Add(d)
+	}
+
+	// 用不跟随重定向的客户端，才能观察到 302 / 429 这类原始状态码。
+	raw := &http.Client{
+		Timeout:       10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	post := func(pass string) *http.Response {
+		t.Helper()
+		resp, err := raw.PostForm(h.srv.URL+"/login", url.Values{
+			"username": {"admin"}, "password": {pass},
+		})
+		if err != nil {
+			t.Fatalf("登录请求失败: %v", err)
+		}
+		return resp
+	}
+
+	// 一次真实失败：验证 handler 已把失败计入限流器。
+	resp := post("wrong-password")
+	readBody(t, resp)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("首次失败应返回 302，实际 %d", resp.StatusCode)
+	}
+	if n := failureCount(t, h.ws.lim, "127.0.0.1"); n != 1 {
+		t.Fatalf("handler 应把失败计入限流器，实际计数 %d", n)
+	}
+
+	// 补足失败次数以触发退避（直接操作限流器，省去真实响应延时）。
+	for i := 1; i < loginFreeAttempts+1; i++ {
+		h.ws.lim.fail("127.0.0.1")
+	}
+
+	// 退避期内应返回 429，并带 Retry-After 与友好提示。
+	resp = post("wrong-password")
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("退避期内应返回 429，实际 %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatal("429 响应应带 Retry-After 头")
+	}
+	if !strings.Contains(body, "过于频繁") {
+		t.Fatal("429 页面应给出友好提示")
+	}
+
+	// 退避期内即使密码正确也必须拒绝，否则限流形同虚设。
+	resp = post("pw123456")
+	readBody(t, resp)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("退避期内即使密码正确也应拒绝，实际 %d", resp.StatusCode)
+	}
+
+	// 越过退避期后应自动恢复，且正确密码能正常进入面板。
+	advance(loginMaxBackoff + time.Second)
+	_, resp = loginClient(t, h.srv.URL, "admin", "pw123456")
+	body = readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("退避结束后应能正常登录，实际 %d", resp.StatusCode)
+	}
+	if !strings.Contains(body, "服务器面板") {
+		t.Fatal("退避结束后正确密码应进入面板")
+	}
+	if n := failureCount(t, h.ws.lim, "127.0.0.1"); n != 0 {
+		t.Fatalf("登录成功后应清除失败计数，实际 %d", n)
+	}
+}
+
+// failureCount 读取限流器中某 IP 的累计失败次数（测试专用）。
+func failureCount(t *testing.T, l *loginLimiter, ip string) int {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if st := l.ips[ip]; st != nil {
+		return st.failures
+	}
+	return 0
 }
 
 // ---------- 测试辅助 ----------

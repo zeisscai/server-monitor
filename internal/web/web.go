@@ -20,6 +20,7 @@ import (
 
 	"server-monitor/internal/config"
 	"server-monitor/internal/engine"
+	"server-monitor/internal/security"
 	"server-monitor/internal/store"
 )
 
@@ -37,6 +38,7 @@ type Server struct {
 	st   *store.Store
 	eng  *engine.Engine
 	tmpl *template.Template
+	lim  *loginLimiter
 }
 
 // New 构建 Web 服务。
@@ -55,7 +57,7 @@ func New(cfg *config.Manager, st *store.Store, eng *engine.Engine) (*Server, err
 	if err != nil {
 		return nil, fmt.Errorf("解析页面模板失败: %w", err)
 	}
-	return &Server{cfg: cfg, st: st, eng: eng, tmpl: t}, nil
+	return &Server{cfg: cfg, st: st, eng: eng, tmpl: t, lim: newLoginLimiter()}, nil
 }
 
 // Handler 返回 Web 路由。
@@ -188,9 +190,37 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	user := strings.TrimSpace(r.FormValue("username"))
 	pass := r.FormValue("password")
+	ip := security.ClientIP(r)
+
+	// 先做限流判定。被拦下的请求不计入失败数，退避会自然衰减。
+	if d := s.lim.allow(ip); !d.Allowed {
+		wait := d.RetryAfter.Round(time.Second)
+		if wait < time.Second {
+			wait = time.Second
+		}
+		// 限流日志按全局 30 秒一次输出，避免攻击者用海量请求把日志写成洪水。
+		security.EventEvery("login_throttled", 30*time.Second, "login_throttled",
+			"ip", ip, "scope", d.Scope, "retry_after", wait.String())
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
+		s.renderStatus(w, http.StatusTooManyRequests, "login.html", map[string]any{
+			"Title":    "登录",
+			"Error":    fmt.Sprintf("登录尝试过于频繁，请 %d 秒后重试", int(wait.Seconds())),
+			"Hostname": s.cfg.Snapshot().ServerName,
+		})
+		return
+	}
+
 	c := s.cfg.Snapshot()
 
-	if subtleEqual(user, c.WebUser) && subtleEqual(pass, c.WebPass) && c.WebPass != "" {
+	// 两个比较都执行完再合并结果：&& 短路会泄露「用户名是否正确」的时序信息。
+	// security.Equal 内部先做 SHA-256，比较长度恒定，长度差异也不再泄露。
+	userOK := security.Equal(user, c.WebUser)
+	passOK := security.Equal(pass, c.WebPass)
+
+	if userOK && passOK && c.WebPass != "" {
+		s.lim.success(ip)
+		security.Event("login_success", "ip", ip, "user", user)
+
 		exp := time.Now().Add(7 * 24 * time.Hour).Unix()
 		http.SetCookie(w, &http.Cookie{
 			Name:     sessionCookie,
@@ -203,8 +233,15 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
+
+	failures, banFor := s.lim.fail(ip)
+	security.Event("login_failure", "ip", ip, "user", user, "failures", failures)
+	if banFor > 0 {
+		security.Event("login_backoff", "ip", ip, "failures", failures, "backoff", banFor.String())
+	}
+
 	// 轻微延时，降低暴力破解效率。
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(loginFailureDelay)
 	http.Redirect(w, r, "/login?error="+urlEncode("账号或密码错误"), http.StatusFound)
 }
 
@@ -413,8 +450,14 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 // ---------- 工具 ----------
 
 func (s *Server) render(w http.ResponseWriter, name string, data any) {
+	s.renderStatus(w, http.StatusOK, name, data)
+}
+
+// renderStatus 与 render 相同，但可指定 HTTP 状态码（例如限流时的 429）。
+func (s *Server) renderStatus(w http.ResponseWriter, code int, name string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
 	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
 		http.Error(w, "页面渲染失败", http.StatusInternalServerError)
 	}
@@ -449,10 +492,6 @@ func parseMs(v string, def int64) int64 {
 		}
 	}
 	return def
-}
-
-func subtleEqual(a, b string) bool {
-	return hmac.Equal([]byte(a), []byte(b))
 }
 
 func urlEncode(s string) string {

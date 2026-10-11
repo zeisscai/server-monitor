@@ -17,6 +17,7 @@ import (
 
 	"server-monitor/internal/collect"
 	"server-monitor/internal/config"
+	"server-monitor/internal/security"
 	"server-monitor/internal/store"
 )
 
@@ -209,7 +210,12 @@ func (e *Engine) handleReport(w http.ResponseWriter, r *http.Request) {
 	if key == "" {
 		key = strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
 	}
-	if key != c.ReceiveAPIKey {
+	// 常量时间比较：普通 != 会在首个不同字节处短路，理论上可被用来逐字节
+	// 猜测 Key。该接口未认证即可访问，因此鉴权失败日志按 IP 限频，防止
+	// 攻击者用海量请求把日志写成洪水。
+	if !security.Equal(key, c.ReceiveAPIKey) {
+		security.EventEvery("report_auth:"+security.ClientIP(r), time.Minute,
+			"report_auth_failure", "ip", security.ClientIP(r))
 		writeJSON(w, http.StatusUnauthorized, false, "API-Key 校验失败")
 		return
 	}
