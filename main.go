@@ -163,7 +163,9 @@ func runInit(args []string) int {
 	user := strings.TrimSpace(*webUser)
 	pass := *webPass
 	cur := cfg.Snapshot()
-	if pass == "" {
+	explicitPass := pass != ""
+	if !explicitPass {
+		// 未显式指定则沿用既有口令。
 		pass = cur.WebPass
 	}
 	if user == "" {
@@ -172,6 +174,14 @@ func runInit(args []string) int {
 	if pass == "" {
 		fmt.Fprintln(os.Stderr, "初始化失败：必须通过 --web-pass 指定 Web 登录密码")
 		return 1
+	}
+	// 仅在显式设置新口令时校验强度：沿用既有口令的升级部署不应因为
+	// 历史遗留的弱口令而直接失败（那样会让用户连升级都做不了）。
+	if explicitPass {
+		if err := config.ValidatePassword(user, pass); err != nil {
+			fmt.Fprintln(os.Stderr, "初始化失败：", err)
+			return 1
+		}
 	}
 
 	next, err := cfg.Update(func(x *config.Config) {

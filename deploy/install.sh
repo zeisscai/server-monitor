@@ -89,6 +89,44 @@ gen_password() {
   head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-16
 }
 
+# 校验 Web 登录密码强度。策略与 Go 侧 config.ValidatePassword 保持一致。
+# 这里先拦一道，是为了在录入阶段就提示重填，而不是等 init 失败后终止整个部署。
+# 两处若有出入，以 Go 侧为准（它才是最终写入配置的那一方）。
+check_password_strength() {
+  local user="$1" pass="$2" lower first
+
+  if [ "${#pass}" -lt 8 ]; then
+    warn "密码至少需要 8 个字符（当前 ${#pass} 个）"
+    return 1
+  fi
+  if [ "${#pass}" -gt 128 ]; then
+    warn "密码不能超过 128 个字符"
+    return 1
+  fi
+
+  lower="$(printf '%s' "$pass" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    password|passw0rd|password1|12345678|123456789|1234567890|123456|qwertyui|qwerty123|iloveyou|letmein1|admin123|administrator|changeme|welcome1|smdadmin|servermonitor|monitor123|abc12345|11111111|00000000|88888888)
+      warn "该密码是常见弱口令，请更换一个"
+      return 1
+      ;;
+  esac
+
+  if [ -n "$user" ] && [ "$lower" = "$(printf '%s' "$user" | tr '[:upper:]' '[:lower:]')" ]; then
+    warn "密码不能与登录账号相同"
+    return 1
+  fi
+
+  # 全部为同一字符（如 88888888）；引号确保首字符为 * 或 ? 时按字面处理。
+  first="${pass:0:1}"
+  if [ -z "${pass//"$first"/}" ]; then
+    warn "密码不能是同一个字符的重复"
+    return 1
+  fi
+
+  return 0
+}
+
 # 从已有配置文件中读取一个数值字段，不存在时输出空。
 read_cfg_num() {
   local key="$1"
@@ -188,11 +226,18 @@ read_inputs() {
 
   local auto_pass
   auto_pass="$(gen_password)"
-  read -r -p "Web 登录密码 [回车随机生成]: " WEB_PASS || true
-  if [ -z "${WEB_PASS:-}" ]; then
-    WEB_PASS="$auto_pass"
-    info "已随机生成密码"
-  fi
+  while :; do
+    read -r -p "Web 登录密码（至少 8 位，回车随机生成）: " WEB_PASS || true
+    if [ -z "${WEB_PASS:-}" ]; then
+      WEB_PASS="$auto_pass"
+      info "已随机生成密码"
+      break
+    fi
+    if check_password_strength "$WEB_USER" "$WEB_PASS"; then
+      break
+    fi
+    warn "请重新输入，或直接回车使用随机生成的强密码"
+  done
 
   while :; do
     read -r -p "待部署的程序二进制文件路径: " BIN_SRC || true

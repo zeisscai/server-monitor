@@ -34,6 +34,68 @@ var AllowedIntervals = []int{2, 5, 10}
 // IntervalWhenReportOff 上报功能关闭时的默认采集频率（秒）。
 const IntervalWhenReportOff = 5
 
+// 口令强度策略。
+//
+// 刻意不引入「必须含大小写 / 数字 / 符号」这类组合规则：NIST SP 800-63B 指出
+// 组合规则会促使用户选择可预测的变体（如 Password1!），而**长度**与**弱口令
+// 黑名单**才是有效手段。因此这里只做长度下限、黑名单、以及明显可猜的取值。
+const (
+	// MinPasswordLen 是 Web 登录密码的最小长度（按字符计，非字节）。
+	MinPasswordLen = 8
+	// MaxPasswordLen 是 Web 登录密码的长度上限，防止异常超长输入。
+	MaxPasswordLen = 128
+)
+
+// weakPasswords 是常见弱口令的小型黑名单（按小写比较）。
+var weakPasswords = map[string]bool{
+	"password": true, "passw0rd": true, "password1": true,
+	"12345678": true, "123456789": true, "1234567890": true, "123456": true,
+	"qwertyui": true, "qwerty123": true, "iloveyou": true, "letmein1": true,
+	"admin123": true, "administrator": true, "changeme": true, "welcome1": true,
+	"smdadmin": true, "servermonitor": true, "monitor123": true,
+	"abc12345": true, "11111111": true, "00000000": true, "88888888": true,
+}
+
+// ValidatePassword 校验 Web 登录口令强度。
+//
+// user 用于拒绝「口令与账号相同」这种最容易被猜到的取值——默认账号
+// smdadmin 是公开写在文档里的，若口令也叫 smdadmin 等于没有口令。
+func ValidatePassword(user, pass string) error {
+	n := len([]rune(pass))
+	if n < MinPasswordLen {
+		return fmt.Errorf("Web 登录密码至少需要 %d 个字符，当前只有 %d 个", MinPasswordLen, n)
+	}
+	if n > MaxPasswordLen {
+		return fmt.Errorf("Web 登录密码不能超过 %d 个字符", MaxPasswordLen)
+	}
+
+	lower := strings.ToLower(pass)
+	if weakPasswords[lower] {
+		return fmt.Errorf("Web 登录密码是常见弱口令，请更换一个")
+	}
+
+	u := strings.ToLower(strings.TrimSpace(user))
+	if u != "" && lower == u {
+		return fmt.Errorf("Web 登录密码不能与登录账号相同")
+	}
+
+	if allSameRune(pass) {
+		return fmt.Errorf("Web 登录密码不能是同一个字符的重复")
+	}
+	return nil
+}
+
+// allSameRune 判断字符串是否由同一个字符重复构成（如 88888888）。
+func allSameRune(s string) bool {
+	rs := []rune(s)
+	for _, r := range rs {
+		if r != rs[0] {
+			return false
+		}
+	}
+	return len(rs) > 0
+}
+
 var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // Config 是配置文件的完整结构。

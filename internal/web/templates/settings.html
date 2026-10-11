@@ -13,6 +13,7 @@
   {{if .ErrorMsg}}<div class="alert alert-error">{{.ErrorMsg}}</div>{{end}}
 
   <form method="post" action="/settings" class="settings-form">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
 
     <section class="card">
       <div class="card-head">

@@ -72,7 +72,12 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /login", s.handleLoginPage)
 	mux.HandleFunc("POST /login", s.handleLoginPost)
-	mux.HandleFunc("GET /logout", s.handleLogout)
+	// 退出必须是带 CSRF 校验的 POST：若允许 GET 退出，跨站的顶层跳转
+	// 就能把用户强制登出。GET 保留一个无害跳转，兼容旧书签。
+	mux.HandleFunc("POST /logout", s.auth(s.handleLogout))
+	mux.HandleFunc("GET /logout", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/", http.StatusFound)
+	})
 
 	mux.HandleFunc("GET /{$}", s.auth(s.handlePanel))
 	mux.HandleFunc("GET /server/{uuid}", s.auth(s.handleDetail))
@@ -135,9 +140,21 @@ func (s *Server) currentUser(r *http.Request) (string, bool) {
 	return s.verifyToken(ck.Value)
 }
 
+// sessionFingerprint 返回绑定当前凭证的短指纹。
+//
+// 把它放进令牌载荷后，登录态就与「当时的账号 + 口令 + 会话密钥」绑定：
+// 任一变更都会让此前签发的所有 Cookie 立即失效，无需服务端会话表。
+// 这正是「改了密码，旧登录态却还能用满 7 天」问题的解法。
+func (s *Server) sessionFingerprint() string {
+	c := s.cfg.Snapshot()
+	sum := sha256.Sum256([]byte(c.SessionSecret + "|" + c.WebUser + "|" + c.WebPass))
+	return hex.EncodeToString(sum[:8])
+}
+
 func (s *Server) sign(user string, exp int64) string {
 	c := s.cfg.Snapshot()
-	payload := user + "|" + strconv.FormatInt(exp, 10)
+	// 顺序为 指纹|过期时间|账号：把账号放最后，账号里即使含 "|" 也不会被截断。
+	payload := strings.Join([]string{s.sessionFingerprint(), strconv.FormatInt(exp, 10), user}, "|")
 	mac := hmac.New(sha256.New, []byte(c.SessionSecret))
 	mac.Write([]byte(payload))
 	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + hex.EncodeToString(mac.Sum(nil))
@@ -156,21 +173,37 @@ func (s *Server) verifyToken(token string) (string, bool) {
 	mac := hmac.New(sha256.New, []byte(c.SessionSecret))
 	mac.Write(payload)
 	want := hex.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(want), []byte(sig)) {
+	if !security.Equal(want, sig) {
 		return "", false
 	}
-	user, expStr, ok := strings.Cut(string(payload), "|")
-	if !ok {
+
+	parts := strings.SplitN(string(payload), "|", 3)
+	if len(parts) != 3 {
 		return "", false
 	}
+	fp, expStr, user := parts[0], parts[1], parts[2]
+
 	exp, err := strconv.ParseInt(expStr, 10, 64)
 	if err != nil || time.Now().Unix() > exp {
 		return "", false
 	}
-	if user != s.cfg.Snapshot().WebUser {
+	// 凭证指纹不符说明口令 / 账号 / 会话密钥已变更，旧登录态一律失效。
+	if !security.Equal(fp, s.sessionFingerprint()) {
+		return "", false
+	}
+	if user != c.WebUser {
 		return "", false
 	}
 	return user, true
+}
+
+// loginErrorMessages 把登录页的错误码映射为固定文案。
+//
+// 只认已知错误码、绝不回显 URL 里的任意文本：否则攻击者可构造一个
+// 「域名正确、页面是真实登录页、但提示内容由攻击者自定义」的链接用于钓鱼
+// （例如 /login?error=系统已停服，请联系管理员QQ…）。
+var loginErrorMessages = map[string]string{
+	"auth": "账号或密码错误",
 }
 
 func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
@@ -179,10 +212,9 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, "login.html", map[string]any{
-		"Title":     "登录",
-		"Error":     r.URL.Query().Get("error"),
-		"Hostname":  s.cfg.Snapshot().ServerName,
-		"RequestID": time.Now().UnixNano(),
+		"Title":    "登录",
+		"Error":    loginErrorMessages[r.URL.Query().Get("e")],
+		"Hostname": s.cfg.Snapshot().ServerName,
 	})
 }
 
@@ -242,12 +274,44 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 
 	// 轻微延时，降低暴力破解效率。
 	time.Sleep(loginFailureDelay)
-	http.Redirect(w, r, "/login?error="+urlEncode("账号或密码错误"), http.StatusFound)
+	http.Redirect(w, r, "/login?e=auth", http.StatusFound)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	if !s.checkCSRF(r) {
+		http.Error(w, "退出请求校验失败，请刷新页面后重试", http.StatusForbidden)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
 	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+// ---------- CSRF ----------
+
+// csrfToken 依据当前会话令牌派生 CSRF token。
+//
+// 采用「无状态派生」而非服务端存储：token = HMAC(会话密钥, "csrf|会话令牌")。
+// 会话令牌是 HttpOnly 且同源的，跨站脚本读不到，因此攻击者无法为受害者的
+// 会话算出合法 token。口令或会话密钥变更时 token 自动失效。
+func (s *Server) csrfToken(r *http.Request) string {
+	ck, err := r.Cookie(sessionCookie)
+	if err != nil || ck.Value == "" {
+		return ""
+	}
+	c := s.cfg.Snapshot()
+	mac := hmac.New(sha256.New, []byte(c.SessionSecret))
+	mac.Write([]byte("csrf|" + ck.Value))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// checkCSRF 校验表单提交的 CSRF token。
+func (s *Server) checkCSRF(r *http.Request) bool {
+	want := s.csrfToken(r)
+	if want == "" {
+		return false
+	}
+	return security.Equal(strings.TrimSpace(r.FormValue("csrf")), want)
 }
 
 // ---------- 页面 ----------
@@ -256,10 +320,11 @@ type baseData struct {
 	Title  string
 	Cfg    config.Config
 	Active string
+	CSRF   string
 }
 
-func (s *Server) base(title, active string) baseData {
-	return baseData{Title: title, Cfg: s.cfg.Snapshot(), Active: active}
+func (s *Server) base(r *http.Request, title, active string) baseData {
+	return baseData{Title: title, Cfg: s.cfg.Snapshot(), Active: active, CSRF: s.csrfToken(r)}
 }
 
 func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +345,7 @@ func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "panel.html", struct {
 		baseData
 		Servers []view
-	}{s.base("面板", "panel"), servers})
+	}{s.base(r, "面板", "panel"), servers})
 }
 
 func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
@@ -301,7 +366,7 @@ func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
 		UUID   string
 		Name   string
 		IsSelf bool
-	}{s.base(name, "panel"), uuid, name, uuid == c.UUID})
+	}{s.base(r, name, "panel"), uuid, name, uuid == c.UUID})
 }
 
 type settingsData struct {
@@ -315,13 +380,13 @@ type settingsData struct {
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	s.renderSettings(w, r, "", r.URL.Query().Get("saved") == "1")
+	s.renderSettings(w, r, http.StatusOK, "", r.URL.Query().Get("saved") == "1")
 }
 
-func (s *Server) renderSettings(w http.ResponseWriter, r *http.Request, errMsg string, saved bool) {
+func (s *Server) renderSettings(w http.ResponseWriter, r *http.Request, code int, errMsg string, saved bool) {
 	c := s.cfg.Snapshot()
 	data := settingsData{
-		baseData:  s.base("设置", "settings"),
+		baseData:  s.base(r, "设置", "settings"),
 		Saved:     saved,
 		ErrorMsg:  errMsg,
 		Listening: s.eng.Running(),
@@ -332,12 +397,19 @@ func (s *Server) renderSettings(w http.ResponseWriter, r *http.Request, errMsg s
 			data.DBSize, data.HasDBSz = n, true
 		}
 	}
-	s.render(w, "settings.html", data)
+	s.renderStatus(w, code, "settings.html", data)
 }
 
 func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		s.renderSettings(w, r, "表单解析失败", false)
+		s.renderSettings(w, r, http.StatusBadRequest, "表单解析失败", false)
+		return
+	}
+	// CSRF 校验必须在任何写操作之前。SameSite=Lax 已能挡住跨站 POST，
+	// 这里是第二道防线，也覆盖了该属性不被支持或未来被放宽的情况。
+	if !s.checkCSRF(r) {
+		s.renderSettings(w, r, http.StatusForbidden,
+			"表单校验失败（页面可能已过期），请刷新页面后重试", false)
 		return
 	}
 	_, err := s.cfg.Update(func(c *config.Config) {
@@ -370,7 +442,7 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 	if err != nil {
-		s.renderSettings(w, r, err.Error(), false)
+		s.renderSettings(w, r, http.StatusOK, err.Error(), false)
 		return
 	}
 	// 配置变更会触发 engine 的热重启回调（见 main.go 中的 OnChange 注册）。
@@ -470,11 +542,42 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// contentSecurityPolicy 是页面的 CSP。
+//
+// script-src 能收紧到 'self'，是因为模板与 app.js 中没有任何内联脚本、
+// 也没有内联事件处理器（onclick 之类），JS 全部来自 /static/app.js。
+// style-src 必须保留 'unsafe-inline'：进度条宽度（panel.html、app.js）
+// 与图表提示配色使用了内联 style 属性，去掉会直接破坏渲染。
+// 样式注入的危害远小于脚本注入，这一取舍是有意的。
+const contentSecurityPolicy = "default-src 'self'; " +
+	"script-src 'self'; " +
+	"style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data:; " +
+	"font-src 'self'; " +
+	"connect-src 'self'; " +
+	"form-action 'self'; " +
+	"frame-ancestors 'none'; " +
+	"base-uri 'none'; " +
+	"object-src 'none'"
+
+// permissionsPolicy 关闭页面用不到的所有浏览器特性，缩小被滥用面。
+const permissionsPolicy = "camera=(), microphone=(), geolocation=(), payment=(), " +
+	"usb=(), serial=(), midi=(), magnetometer=(), gyroscope=()"
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Referrer-Policy", "same-origin")
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "same-origin")
+		h.Set("Content-Security-Policy", contentSecurityPolicy)
+		h.Set("Permissions-Policy", permissionsPolicy)
+		// HSTS 只在请求确实走 TLS 时下发：明文请求上的该头部会被浏览器忽略，
+		// 无条件下发反而会掩盖「其实还没启用 HTTPS」这一事实。
+		// 真正的 HTTPS 支持属于后续工作，届时这里会自动开始生效。
+		if r.TLS != nil {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -492,10 +595,6 @@ func parseMs(v string, def int64) int64 {
 		}
 	}
 	return def
-}
-
-func urlEncode(s string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(s, " ", "%20"), "&", "%26")
 }
 
 // LocalIPs 返回本机非回环 IPv4 地址，用于在设置页提示上报时应填写的 IP。

@@ -79,6 +79,31 @@ func loginClient(t *testing.T, baseURL, user, pass string) (*http.Client, *http.
 	return client, resp
 }
 
+// csrfToken 从设置页中取出当前会话的 CSRF token。
+func csrfToken(t *testing.T, client *http.Client, baseURL string) string {
+	t.Helper()
+	resp, err := client.Get(baseURL + "/settings")
+	if err != nil {
+		t.Fatalf("打开设置页失败: %v", err)
+	}
+	html := readBody(t, resp)
+
+	const marker = `name="csrf" value="`
+	i := strings.Index(html, marker)
+	if i < 0 {
+		t.Fatal("设置页未包含 CSRF token")
+	}
+	rest := html[i+len(marker):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		t.Fatal("CSRF token 格式异常")
+	}
+	if rest[:j] == "" {
+		t.Fatal("CSRF token 为空")
+	}
+	return rest[:j]
+}
+
 func TestAuthFlow(t *testing.T) {
 	h := newHarness(t)
 
@@ -111,11 +136,11 @@ func TestAuthFlow(t *testing.T) {
 		}
 	}
 
-	// 错误密码
+	// 错误密码：应跳回带固定错误码的登录页
 	_, resp = loginClient(t, h.srv.URL, "admin", "wrong-password")
 	body := readBody(t, resp)
-	if !strings.Contains(resp.Request.URL.RawQuery, "error") {
-		t.Fatalf("错误密码应跳回带错误提示的登录页，实际 %s", resp.Request.URL.String())
+	if !strings.Contains(resp.Request.URL.RawQuery, "e=auth") {
+		t.Fatalf("错误密码应跳回带错误码的登录页，实际 %s", resp.Request.URL.String())
 	}
 	if strings.Contains(body, "服务器面板") {
 		t.Fatal("错误密码不应进入面板")
@@ -141,8 +166,10 @@ func TestAuthFlow(t *testing.T) {
 		t.Fatalf("登录后接口应返回 200，实际 %d", r.StatusCode)
 	}
 
-	// 退出登录后失效
-	lr, err := client.Get(h.srv.URL + "/logout")
+	// 退出登录后失效（必须是带 CSRF 的 POST，GET 不再改变状态）
+	lr, err := client.PostForm(h.srv.URL+"/logout", url.Values{
+		"csrf": {csrfToken(t, client, h.srv.URL)},
+	})
 	if err != nil {
 		t.Fatalf("退出失败: %v", err)
 	}
@@ -162,10 +189,12 @@ func TestSettingsToggleAndValidation(t *testing.T) {
 	client, resp := loginClient(t, h.srv.URL, "admin", "pw123456")
 	readBody(t, resp)
 
+	csrf := csrfToken(t, client, h.srv.URL)
 	port := freePort(t)
 
 	// 开启数据接收
 	r, err := client.PostForm(h.srv.URL+"/settings", url.Values{
+		"csrf":            {csrf},
 		"server_name":     {"测试节点"},
 		"receive_enabled": {"1"},
 		"receive_port":    {fmt.Sprint(port)},
@@ -204,6 +233,7 @@ func TestSettingsToggleAndValidation(t *testing.T) {
 
 	// 非法配置（开启上报但未填目标 IP）应被拒绝且不落盘
 	bad, err := client.PostForm(h.srv.URL+"/settings", url.Values{
+		"csrf":               {csrf},
 		"server_name":        {"测试节点"},
 		"report_enabled":     {"1"},
 		"report_target_ip":   {""},
@@ -224,6 +254,7 @@ func TestSettingsToggleAndValidation(t *testing.T) {
 
 	// 非 2/5/10 的上报频率会被纠正为默认 5 秒
 	okResp, err := client.PostForm(h.srv.URL+"/settings", url.Values{
+		"csrf":               {csrf},
 		"server_name":        {"测试节点"},
 		"report_enabled":     {"1"},
 		"report_target_ip":   {"10.0.0.9"},
@@ -241,7 +272,10 @@ func TestSettingsToggleAndValidation(t *testing.T) {
 	}
 
 	// 关闭接收：Key 清空、占用信息隐藏
-	off, err := client.PostForm(h.srv.URL+"/settings", url.Values{"server_name": {"测试节点"}})
+	off, err := client.PostForm(h.srv.URL+"/settings", url.Values{
+		"csrf":        {csrf},
+		"server_name": {"测试节点"},
+	})
 	if err != nil {
 		t.Fatalf("请求失败: %v", err)
 	}
@@ -273,6 +307,7 @@ func TestReportRoundTrip(t *testing.T) {
 
 	port := freePort(t)
 	r, err := client.PostForm(h.srv.URL+"/settings", url.Values{
+		"csrf":            {csrfToken(t, client, h.srv.URL)},
 		"server_name":     {"接收端"},
 		"receive_enabled": {"1"},
 		"receive_port":    {fmt.Sprint(port)},
@@ -567,6 +602,231 @@ func failureCount(t *testing.T, l *loginLimiter, ip string) int {
 		return st.failures
 	}
 	return 0
+}
+
+// 登录页只认固定错误码，不得回显 URL 中的任意文本，否则可被用于钓鱼。
+func TestLoginErrorTextIsNotReflected(t *testing.T) {
+	h := newHarness(t)
+
+	payload := "系统已停服，请联系管理员QQ123456"
+	resp, err := http.Get(h.srv.URL + "/login?error=" + url.QueryEscape(payload))
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	body := readBody(t, resp)
+	if strings.Contains(body, payload) {
+		t.Fatal("登录页回显了 URL 中的任意文本，可被用于钓鱼")
+	}
+	if strings.Contains(body, "alert-error") {
+		t.Fatal("未知错误码不应显示任何提示框")
+	}
+
+	// 已知错误码显示固定文案。
+	resp2, err := http.Get(h.srv.URL + "/login?e=auth")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	body2 := readBody(t, resp2)
+	if !strings.Contains(body2, "账号或密码错误") {
+		t.Fatal("已知错误码应显示固定文案")
+	}
+}
+
+// 设置保存必须携带合法 CSRF token，否则拒绝且不产生任何副作用。
+func TestSettingsRequiresCSRF(t *testing.T) {
+	h := newHarness(t)
+	client, resp := loginClient(t, h.srv.URL, "admin", "pw123456")
+	readBody(t, resp)
+	before := h.cfg.Snapshot().ServerName
+
+	// 缺少 token
+	noTok, err := client.PostForm(h.srv.URL+"/settings", url.Values{"server_name": {"被篡改"}})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, noTok)
+	if noTok.StatusCode != http.StatusForbidden {
+		t.Fatalf("缺少 CSRF token 应返回 403，实际 %d", noTok.StatusCode)
+	}
+	if h.cfg.Snapshot().ServerName != before {
+		t.Fatal("CSRF 校验失败时不应修改配置")
+	}
+
+	// 伪造 token
+	badTok, err := client.PostForm(h.srv.URL+"/settings", url.Values{
+		"csrf":        {"0000000000000000000000000000000000000000000000000000000000000000"},
+		"server_name": {"被篡改"},
+	})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, badTok)
+	if badTok.StatusCode != http.StatusForbidden {
+		t.Fatalf("伪造 CSRF token 应返回 403，实际 %d", badTok.StatusCode)
+	}
+	if h.cfg.Snapshot().ServerName != before {
+		t.Fatal("伪造 token 时不应修改配置")
+	}
+
+	// 合法 token 应放行
+	ok, err := client.PostForm(h.srv.URL+"/settings", url.Values{
+		"csrf":        {csrfToken(t, client, h.srv.URL)},
+		"server_name": {"合法修改"},
+	})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, ok)
+	if h.cfg.Snapshot().ServerName != "合法修改" {
+		t.Fatal("携带合法 CSRF token 的保存应生效")
+	}
+}
+
+// 退出必须是带 CSRF 的 POST：GET 不得改变登录状态（否则可被跨站强制登出）。
+func TestLogoutRequiresPostAndCSRF(t *testing.T) {
+	h := newHarness(t)
+	client, resp := loginClient(t, h.srv.URL, "admin", "pw123456")
+	readBody(t, resp)
+
+	// GET /logout 不应登出
+	gr, err := client.Get(h.srv.URL + "/logout")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, gr)
+	still, err := client.Get(h.srv.URL + "/api/overview")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	if still.StatusCode != http.StatusOK {
+		t.Fatalf("GET /logout 不应登出，接口应仍返回 200，实际 %d", still.StatusCode)
+	}
+	readBody(t, still)
+
+	// 无 CSRF 的 POST 不应登出
+	bad, err := client.PostForm(h.srv.URL+"/logout", url.Values{})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, bad)
+	if bad.StatusCode != http.StatusForbidden {
+		t.Fatalf("无 CSRF 的退出应返回 403，实际 %d", bad.StatusCode)
+	}
+	still2, err := client.Get(h.srv.URL + "/api/overview")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	if still2.StatusCode != http.StatusOK {
+		t.Fatalf("CSRF 校验失败的退出不应登出，实际 %d", still2.StatusCode)
+	}
+	readBody(t, still2)
+
+	// 带 CSRF 的 POST 应登出
+	ok, err := client.PostForm(h.srv.URL+"/logout", url.Values{
+		"csrf": {csrfToken(t, client, h.srv.URL)},
+	})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, ok)
+	after, err := client.Get(h.srv.URL + "/api/overview")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, after)
+	if !strings.HasSuffix(after.Request.URL.Path, "/login") {
+		t.Fatalf("带 CSRF 的退出应生效，实际仍访问到 %s", after.Request.URL.Path)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	h := newHarness(t)
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(h.srv.URL + "/login")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	for k, want := range map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"Referrer-Policy":        "same-origin",
+	} {
+		if got := resp.Header.Get(k); got != want {
+			t.Fatalf("%s 应为 %q，实际 %q", k, want, got)
+		}
+	}
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("应下发 Content-Security-Policy")
+	}
+	for _, part := range []string{
+		"default-src 'self'",
+		"script-src 'self'",
+		"form-action 'self'",
+		"frame-ancestors 'none'",
+		"base-uri 'none'",
+		"object-src 'none'",
+	} {
+		if !strings.Contains(csp, part) {
+			t.Fatalf("CSP 应包含 %q，实际 %q", part, csp)
+		}
+	}
+	// 关键断言：脚本不允许内联，否则 CSP 对 XSS 的防护大打折扣。
+	if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") ||
+		strings.Contains(csp, "script-src 'unsafe-inline'") {
+		t.Fatalf("script-src 不应允许 'unsafe-inline'，实际 %q", csp)
+	}
+
+	if resp.Header.Get("Permissions-Policy") == "" {
+		t.Fatal("应下发 Permissions-Policy")
+	}
+
+	// 明文 HTTP 下不应下发 HSTS（会被浏览器忽略，且会掩盖尚未启用 HTTPS 的事实）。
+	if got := resp.Header.Get("Strict-Transport-Security"); got != "" {
+		t.Fatalf("明文 HTTP 下不应下发 HSTS，实际 %q", got)
+	}
+}
+
+// 修改口令后，此前签发的所有登录态必须立即失效。
+func TestSessionInvalidatedOnPasswordChange(t *testing.T) {
+	h := newHarness(t)
+	client, resp := loginClient(t, h.srv.URL, "admin", "pw123456")
+	readBody(t, resp)
+
+	ok, err := client.Get(h.srv.URL + "/api/overview")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("登录后接口应返回 200，实际 %d", ok.StatusCode)
+	}
+	readBody(t, ok)
+
+	// 等价于部署脚本重新 init，或手工编辑配置后重启。
+	if _, err := h.cfg.Update(func(c *config.Config) {
+		c.WebPass = "a-brand-new-password"
+	}); err != nil {
+		t.Fatalf("修改密码失败: %v", err)
+	}
+
+	after, err := client.Get(h.srv.URL + "/api/overview")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, after)
+	if !strings.HasSuffix(after.Request.URL.Path, "/login") {
+		t.Fatalf("改密码后旧登录态应立即失效，实际仍访问到 %s", after.Request.URL.Path)
+	}
+
+	// 新口令应能正常登录。
+	_, resp2 := loginClient(t, h.srv.URL, "admin", "a-brand-new-password")
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("新口令应能登录，实际 %d", resp2.StatusCode)
+	}
+	readBody(t, resp2)
 }
 
 // ---------- 测试辅助 ----------
