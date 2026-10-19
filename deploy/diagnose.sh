@@ -129,6 +129,31 @@ fi
 hr "7. 最近日志"
 $SUDO journalctl -u "$APP_NAME" -n 30 --no-pager 2>&1 | sed 's/^/  | /'
 
+hr "8. 接收端容量（千台上报相关）"
+UNIT_NOFILE="$($SUDO grep -i '^LimitNOFILE' "$UNIT_FILE" 2>/dev/null | tr -d ' ')"
+if [ -n "$UNIT_NOFILE" ]; then
+  ok "systemd 单元 $UNIT_NOFILE"
+else
+  warn "单元未设置 LimitNOFILE（默认 1024），千台上报会因句柄耗尽出现连接重置"
+fi
+if [ -r /proc/sys/net/core/somaxconn ]; then
+  SOMAX="$(cat /proc/sys/net/core/somaxconn)"
+  if [ "${SOMAX:-0}" -ge 1024 ] 2>/dev/null; then
+    ok "监听队列上限 net.core.somaxconn=${SOMAX}"
+  else
+    warn "监听队列上限 net.core.somaxconn=${SOMAX}，千台同时重连时会丢连接"
+    info "调高：sudo sysctl -w net.core.somaxconn=4096（并在 /etc/sysctl.conf 中持久化）"
+  fi
+fi
+RECV_PORT=""
+if [ -f "$CONFIG_FILE" ] && command -v python3 >/dev/null 2>&1; then
+  RECV_PORT="$($SUDO python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("receive_port") or "")' "$CONFIG_FILE" 2>/dev/null)"
+fi
+if [ -n "$RECV_PORT" ] && command -v ss >/dev/null 2>&1; then
+  ESTAB="$($SUDO ss -Htn state established "( sport = :${RECV_PORT} )" 2>/dev/null | wc -l | tr -d ' ')"
+  info "接收端口 ${RECV_PORT} 当前长连接数：${ESTAB:-0}"
+fi
+
 hr "诊断结束"
 printf '  常见结论：\n'
 printf '    - 输出含「启动失败：读取配置文件失败 … permission denied」→ 单元里的 User= 与文件属主不一致（见第 3 节）\n'

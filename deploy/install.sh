@@ -349,6 +349,8 @@ Type=simple
 ExecStart=${BIN_DEST} --config ${CONFIG_FILE} --data-dir ${DATA_DIR}
 Restart=always
 RestartSec=5
+# 千台上报时每台保持一条长连接，默认 1024 个句柄不够用。
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target

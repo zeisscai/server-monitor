@@ -104,6 +104,8 @@ Type=simple
 ExecStart=/opt/server-monitor/server-monitor --config /opt/server-monitor/config.json --data-dir /opt/server-monitor/data
 Restart=always
 RestartSec=5
+# 千台上报时每台保持一条长连接，默认 1024 个句柄不够用。
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -223,7 +225,8 @@ sudo bash install.sh
 
 - SQLite 存储，区分数据来源（本机 / 上报）；
 - **所有历史数据永久保留**，不做清理；
-- 启用 WAL 模式，串行化写入，保证采集不丢点。
+- 启用 WAL 模式；写入由单线程攒批提交（见第 12 节），千台上报也不会丢点；
+- 每台服务器的「最新状态」另外维护在 `server_latest` 表，面板查询与历史数据量无关。
 
 ### 6.3 数据接收（默认关闭）
 
@@ -298,6 +301,21 @@ Cookie 载荷中绑定了当前凭证的指纹，因此**修改口令（重新�
 
 索引：`(server_uuid, created_at)`、`(created_at)`。
 
+表 `server_latest`（每台服务器一行，由写入线程在同一事务内维护）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `server_uuid` | TEXT | 主键 |
+| `server_name` | TEXT | 最近一次上报的名称 |
+| `cpu_usage` | REAL | 最新 CPU 占用率 |
+| `mem_usage` | REAL | 最新内存占用率 |
+| `source` | TEXT | 最近一条记录的来源 |
+| `created_at` | INTEGER | 最近一条记录的时间（乱序上报不会回退） |
+| `cnt` | INTEGER | 该服务器累计记录数 |
+
+> 老版本数据库首次被新版本打开时，会自动从 `records` 回填这张表（每台一行，只做一次）。
+> 面板与 `/api/overview` 只读这张表，因此即使历史数据上亿行，刷新依旧是毫秒级。
+
 数据库文件：`<数据目录>/monitor.db`（含 `-wal` / `-shm` 附属文件）。
 
 ---
@@ -307,14 +325,16 @@ Cookie 载荷中绑定了当前凭证的指纹，因此**修改口令（重新�
 ```
 .
 ├── main.go                      CLI 入口（serve / init / version）
+├── rlimit_unix.go               启动时抬高文件句柄上限（Linux / macOS）
 ├── build.sh                     交叉编译脚本
 ├── deploy/install.sh            部署初始化脚本（交互式 + systemd）
 ├── REQUIREMENTS.md              开发需求文档
 └── internal
     ├── config/                  配置文件生成、读取、校验、持久化
     ├── collect/                 指标采集（Linux /proc，macOS 兜底）
-    ├── store/                   SQLite 存储层
+    ├── store/                   SQLite 存储层（单写线程 + 攒批提交 + server_latest）
     ├── engine/                  采集 / 上报 / 接收运行时
+    │   └── load_test.go         千台规模压测（SMD_LOAD=1 开启）
     ├── security/                常量时间比较、安全审计日志、客户端地址解析
     └── web/                     Web 服务
         ├── web.go               路由、认证、页面与接口
@@ -455,4 +475,81 @@ sudo bash deploy/diagnose.sh
 | 所有人登录都返回 `429` | 60 秒内全局失败次数达到上限，可能正被分布式爆破 | 最多等 1 分钟自动恢复；用 `journalctl -u server-monitor \| grep '\[安全\]'` 确认来源 |
 
 应急时可 `systemctl restart server-monitor` 立即清空退避状态（退避记录只在内存中）。
+
+---
+
+## 12. 千台规模：并发模型与容量
+
+### 12.1 写入模型
+
+接收端把「HTTP 处理」与「落盘」解耦，所有写入收敛到一个写线程：
+
+```
+HTTP 上报 ──校验──▶ 写入队列(16384) ──▶ 单写线程
+                                          ├─ 攒批(≤512 条 / 3ms) ─▶ 一次 BEGIN/COMMIT
+                                          └─ server_latest（每台一行，同事务维护）
+只读查询 ─────────────────────────────▶ 连接池（WAL，一写多读）
+```
+
+- **单写线程**：SQLite 只允许一个写者，与其让几百个 goroutine 抢一把锁，不如让它们排队进
+  一个 channel，由唯一的写线程顺序提交；
+- **攒批提交**：把「每条一次 commit」变成「每批一次 commit」。空载时批很小、延迟低；
+  高负载时批自然变大，吞吐随并发上升；
+- **物化最新值**：面板不再对历史表做 `JOIN + 相关子查询`（旧实现要扫每台服务器的全部历史），
+  改成读一张 1000 行的表；
+- **读写分离**：读走连接池里的其它连接，WAL 下与写入互不阻塞，面板刷新不再卡住上报；
+- **背压而非丢弃**：队列满时 `Insert` 阻塞，HTTP 请求随之变慢，但不会丢数据。
+  只有事务提交成功后才会返回 `200`，即**已确认的上报一定已经落盘**。
+
+### 12.2 实测数据
+
+环境：macOS（Apple Silicon），1000 台模拟上报（每 2 秒一次，约 440 req/s），
+数据库预置 200 万条历史，面板每 500ms 刷新一次：
+
+| 指标 | 优化前 | 优化后 |
+| --- | --- | --- |
+| 上报延迟 p50 | 50 ms | **3.8 ms** |
+| 上报延迟 p95 | 339 ms | **4.5 ms** |
+| 上报延迟 p99 | 497 ms | **5.9 ms** |
+| 上报延迟 max | 558 ms | **8.6 ms** |
+| 面板 `Latest()` 最慢一次 | 596 ms | **7 ms** |
+| 1000 台同时重连（突发） | 成功 1000 / 失败 0 | 成功 1000 / 失败 0 |
+| 吞吐上限（1000 并发持续压） | 11.7k req/s（含失败） | **25.4k req/s** |
+| `Latest()` @1000 台 / 200 万条 | 490 ms | **1.0 ms** |
+| 落库完整性 | 5000 / 5000 | 2005000 / 2005000 |
+
+> 空载单条上报的延迟会从 0.27ms 变成约 3.9ms —— 这是攒批窗口（3ms）的代价，
+> 换来的是高并发下不再排队、以及面板查询不再拖慢写入。对 2 秒一次的上报频率可以忽略。
+
+复现方式（需显式开启，默认跳过）：
+
+```bash
+SMD_LOAD=1 go test ./internal/engine -run TestLoadReports -v -timeout 15m
+SMD_LOAD=1 SMD_SEED=2000000 SMD_PANEL=1 go test ./internal/engine -run TestLoadReports -v
+SMD_LOAD=1 SMD_WORKERS=1000 SMD_SECS=6 go test ./internal/engine -run TestLoadThroughput -v
+SMD_LOAD=1 go test ./internal/engine -run TestLoadLatest -v
+```
+
+### 12.3 部署侧需要配合的参数
+
+| 项 | 建议值 | 说明 |
+| --- | --- | --- |
+| `LimitNOFILE`（systemd） | `65535` | 程序启动时会自动把软限制抬到硬限制；单元里仍需放开硬限制，否则抬不上去 |
+| `net.core.somaxconn` | `4096` | 千台同时重连（如接收端重启）时的 accept 队列上限，默认 1024 可能丢连接 |
+| 上报频率 | 5 或 10 秒 | 千台规模下 2 秒一次意味着 500 req/s，5 秒只需 200 req/s，更从容 |
+
+`deploy/diagnose.sh` 第 8 节会直接打印当前 `LimitNOFILE`、`somaxconn` 与接收端口的长连接数。
+
+### 12.4 容量参考
+
+按实测 25k req/s 的接收上限，单实例可承受：
+
+| 上报频率 | 理论上限台数 | 建议运行区间 |
+| --- | --- | --- |
+| 2 秒 | 约 50000 台 | ≤ 5000 台 |
+| 5 秒 | 约 125000 台 | ≤ 10000 台 |
+| 10 秒 | 约 250000 台 | ≤ 20000 台 |
+
+真正的长期瓶颈不是写入，而是**历史数据体积**：1000 台 × 2 秒 ≈ 每天 4300 万行、约 2~3 GB。
+按需求「历史数据永久保留」，请预留磁盘并定期备份 `monitor.db`。
 

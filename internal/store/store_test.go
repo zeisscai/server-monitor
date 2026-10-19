@@ -1,9 +1,13 @@
 package store
 
 import (
+	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -222,5 +226,159 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 	n, err := s2.Count()
 	if err != nil || n != 1 {
 		t.Fatalf("重开后数据应保留: %v %d", err, n)
+	}
+}
+
+// 并发写入：多台服务器同时上报时，记录不能丢、计数不能错。
+func TestConcurrentInserts(t *testing.T) {
+	s := newTestStore(t)
+	const workers, per = 200, 25
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers*per)
+	base := time.Now().Add(-time.Minute).UnixMilli()
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			uuid := fmt.Sprintf("dddddddd-0000-4000-8000-%012d", w)
+			for i := 0; i < per; i++ {
+				err := s.Insert(Record{
+					ServerUUID: uuid, ServerName: "并发",
+					CPU: float64(i), Mem: 50, Source: SourceRemote,
+					CreatedAt: base + int64(i)*1000,
+				})
+				if err != nil {
+					errCh <- err
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("并发写入失败: %v", err)
+	}
+
+	n, err := s.Count()
+	if err != nil || n != workers*per {
+		t.Fatalf("应有 %d 条记录，实际 %d（%v）", workers*per, n, err)
+	}
+	latest, err := s.Latest()
+	if err != nil || len(latest) != workers {
+		t.Fatalf("应有 %d 台服务器，实际 %d（%v）", workers, len(latest), err)
+	}
+	for _, l := range latest {
+		if l.Count != per {
+			t.Fatalf("%s 计数应为 %d，实际 %d", l.ServerUUID, per, l.Count)
+		}
+		if l.CPU != float64(per-1) {
+			t.Fatalf("%s 最新一条应取时间最大的记录，实际 CPU=%v", l.ServerUUID, l.CPU)
+		}
+	}
+}
+
+// 乱序上报：更旧的记录不应把面板上的最新值改回去，但计数要照常累加。
+func TestOutOfOrderReports(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().UnixMilli()
+	if err := s.Insert(Record{ServerUUID: uuidA, ServerName: "新", CPU: 80, Mem: 70, Source: SourceRemote, CreatedAt: now}); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	if err := s.Insert(Record{ServerUUID: uuidA, ServerName: "旧", CPU: 10, Mem: 20, Source: SourceRemote, CreatedAt: now - 5000}); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	latest, err := s.Latest()
+	if err != nil || len(latest) != 1 {
+		t.Fatalf("Latest 失败: %v %d", err, len(latest))
+	}
+	if latest[0].CPU != 80 || latest[0].ServerName != "新" || latest[0].CreatedAt != now {
+		t.Fatalf("旧记录不应覆盖最新值: %+v", latest[0])
+	}
+	if latest[0].Count != 2 {
+		t.Fatalf("计数应包含乱序记录，实际 %d", latest[0].Count)
+	}
+}
+
+// 老版本升级：历史表已有数据、物化表为空时，Open 应自动回填最新值。
+func TestBackfillLatestOnUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "monitor.db")
+
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)")
+	if err != nil {
+		t.Fatalf("打开老库失败: %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE records (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			server_uuid TEXT    NOT NULL,
+			server_name TEXT    NOT NULL,
+			cpu_usage   REAL    NOT NULL,
+			mem_usage   REAL    NOT NULL,
+			source      TEXT    NOT NULL,
+			created_at  INTEGER NOT NULL
+		);
+		CREATE INDEX idx_records_uuid_time ON records (server_uuid, created_at);
+		CREATE INDEX idx_records_time      ON records (created_at);`); err != nil {
+		t.Fatalf("建老表失败: %v", err)
+	}
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	rows := [][4]any{
+		{uuidA, "A-旧名", 10.0, base},
+		{uuidA, "A-新名", 90.0, base + 1000},
+		{uuidA, "A-中间", 50.0, base + 500},
+		{uuidB, "B", 30.0, base + 2000},
+	}
+	for _, r := range rows {
+		if _, err := db.Exec(
+			`INSERT INTO records (server_uuid, server_name, cpu_usage, mem_usage, source, created_at)
+			 VALUES (?, ?, ?, 40, 'remote', ?)`, r[0], r[1], r[2], r[3],
+		); err != nil {
+			t.Fatalf("写老数据失败: %v", err)
+		}
+	}
+	db.Close()
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("升级打开失败: %v", err)
+	}
+	defer s.Close()
+
+	latest, err := s.Latest()
+	if err != nil || len(latest) != 2 {
+		t.Fatalf("回填后应有 2 台服务器: %v %d", err, len(latest))
+	}
+	byID := map[string]Latest{}
+	for _, l := range latest {
+		byID[l.ServerUUID] = l
+	}
+	if a := byID[uuidA]; a.Count != 3 || a.CPU != 90 || a.ServerName != "A-新名" {
+		t.Fatalf("A 的回填结果不正确: %+v", a)
+	}
+	if b := byID[uuidB]; b.Count != 1 || b.CPU != 30 {
+		t.Fatalf("B 的回填结果不正确: %+v", b)
+	}
+	if n, _ := s.Count(); n != 4 {
+		t.Fatalf("总记录数应为 4，实际 %d", n)
+	}
+}
+
+// 关闭后再写入应返回 ErrClosed，而不是 panic 或阻塞。
+func TestInsertAfterClose(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("打开失败: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	if err := s.Insert(Record{ServerUUID: uuidA, ServerName: "A", CPU: 1, Mem: 2}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("关闭后写入应返回 ErrClosed，实际 %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("重复关闭不应报错: %v", err)
 	}
 }

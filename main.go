@@ -130,6 +130,13 @@ func runServe(args []string) int {
 	fmt.Printf("  数据目录 : %s\n", dd)
 	fmt.Printf("  访问地址 : http://<本机IP>:%d\n", cur.WebPort)
 	fmt.Printf("  识别码   : %s\n", cur.UUID)
+	if n, err := raiseFileLimit(); err != nil {
+		fmt.Fprintf(os.Stderr, "提示：文件句柄上限提升失败（%v），千台上报前请调高 ulimit -n\n", err)
+	} else if n < 4096 {
+		fmt.Fprintf(os.Stderr, "提示：文件句柄上限仅 %d，千台上报前请调高（systemd 单元 LimitNOFILE 或 ulimit -n）\n", n)
+	} else {
+		fmt.Printf("  句柄上限 : %d\n", n)
+	}
 
 	if err := ws.Run(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, "服务异常退出：", err)

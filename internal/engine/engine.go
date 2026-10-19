@@ -8,9 +8,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -180,19 +182,26 @@ func (e *Engine) receiveLoop(ctx context.Context, port int) {
 	mux.HandleFunc("/api/report", e.handleReport)
 
 	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           mux,
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: mux,
+		// 千台规模的接收端参数：只读 64KB 请求体、短头部超时，
+		// 空闲连接保留一段时间以便上报端复用（避免每 2 秒重建 TCP/TLS 之外的握手）。
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// Shutdown 会等待在途请求处理完（写入队列里的数据不会丢）。
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	_ = srv.ListenAndServe()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Fprintf(os.Stderr, "数据接收端口 %d 监听失败：%v\n", port, err)
+	}
 }
 
 func (e *Engine) handleReport(w http.ResponseWriter, r *http.Request) {
@@ -220,8 +229,9 @@ func (e *Engine) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 上报体很小，限制上限可防止畸形请求占用内存。
 	var p reportPayload
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&p); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&p); err != nil {
 		writeJSON(w, http.StatusBadRequest, false, "请求体解析失败")
 		return
 	}
@@ -283,10 +293,16 @@ func (e *Engine) handleReport(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, code int, ok bool, msg string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	resp := map[string]any{"ok": ok}
-	if msg != "" {
-		resp["error"] = msg
+	// 成功路径是热点（每秒数百次），直接写固定字节，省掉一次 map + Encoder 分配。
+	if msg == "" {
+		if ok {
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		} else {
+			_, _ = w.Write([]byte(`{"ok":false}`))
+		}
+		return
 	}
+	resp := map[string]any{"ok": ok, "error": msg}
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
