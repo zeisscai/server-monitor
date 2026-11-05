@@ -1046,3 +1046,110 @@ func TestHumanUptime(t *testing.T) {
 		}
 	}
 }
+
+// 查询 API 挂在 Web 端口上：不需要登录会话，只用 API-Key；
+// 且不依赖数据接收端口是否开启。
+func TestQueryAPIServedOnWebPort(t *testing.T) {
+	h := newHarness(t)
+
+	// 未开启时明确拒绝（且不需要先登录就能拿到这个答复）
+	resp, err := http.Get(h.srv.URL + "/api/servers")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, resp)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("未开启应返回 403，实际 %d", resp.StatusCode)
+	}
+
+	c := h.cfg.Snapshot()
+	if c.ReceiveEnabled {
+		t.Fatal("前置条件：本用例不应开启数据接收")
+	}
+	if _, err := h.cfg.Update(func(c *config.Config) { c.APIEnabled = true }); err != nil {
+		t.Fatalf("开启查询 API 失败: %v", err)
+	}
+	c = h.cfg.Snapshot()
+	if len(c.APIKey) != 18 {
+		t.Fatalf("应生成 18 位 Key，实际 %q", c.APIKey)
+	}
+
+	// 一台外来服务器 + 一条记录，用于确认返回内容
+	remote := "ffffffff-6666-4666-8666-ffffffffffff"
+	if err := h.st.Insert(store.Record{
+		ServerUUID: remote, ServerName: "web-port-node", CPU: 1.5, Mem: 2.5,
+		Source: store.SourceRemote, CreatedAt: time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatalf("写入记录失败: %v", err)
+	}
+
+	get := func(key string) *http.Response {
+		req, err := http.NewRequest(http.MethodGet, h.srv.URL+"/api/servers", nil)
+		if err != nil {
+			t.Fatalf("构造请求失败: %v", err)
+		}
+		if key != "" {
+			req.Header.Set("X-API-Key", key)
+		}
+		// 刻意用一个没有 Cookie 的客户端：证明它不走登录会话
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatalf("请求失败: %v", err)
+		}
+		return resp
+	}
+
+	if r := get(""); r.StatusCode != http.StatusUnauthorized {
+		readBody(t, r)
+		t.Fatalf("无 Key 应返回 401，实际 %d", r.StatusCode)
+	} else {
+		readBody(t, r)
+	}
+	if r := get("wrong-key"); r.StatusCode != http.StatusUnauthorized {
+		readBody(t, r)
+		t.Fatalf("错误 Key 应返回 401，实际 %d", r.StatusCode)
+	} else {
+		readBody(t, r)
+	}
+
+	r := get(c.APIKey)
+	body := readBody(t, r)
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("正确 Key 应返回 200，实际 %d（%s）", r.StatusCode, body)
+	}
+	var got struct {
+		OK      bool `json:"ok"`
+		Servers []struct {
+			UUID   string  `json:"uuid"`
+			CPU    float64 `json:"cpu"`
+			Kernel string  `json:"kernel"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	var found bool
+	for _, s := range got.Servers {
+		if s.UUID == remote {
+			found = true
+			if s.CPU != 1.5 {
+				t.Fatalf("返回内容不正确: %+v", s)
+			}
+		}
+	}
+	if !got.OK || !found {
+		t.Fatalf("应返回该服务器: %s", body)
+	}
+
+	// 非 GET 仍应 405
+	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/api/servers", nil)
+	req.Header.Set("X-API-Key", c.APIKey)
+	pr, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, pr)
+	if pr.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST 应返回 405，实际 %d", pr.StatusCode)
+	}
+}

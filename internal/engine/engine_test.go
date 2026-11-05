@@ -227,7 +227,7 @@ func getAPI(e *Engine, path, key string) *httptest.ResponseRecorder {
 		req.Header.Set("X-API-Key", key)
 	}
 	rec := httptest.NewRecorder()
-	e.handleServersAPI(rec, req)
+	e.ServeServersAPI(rec, req)
 	return rec
 }
 
@@ -364,7 +364,7 @@ func TestServersAPIRejectsNonGet(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/servers", strings.NewReader("{}"))
 	req.Header.Set("X-API-Key", c.APIKey)
 	rec := httptest.NewRecorder()
-	e.handleServersAPI(rec, req)
+	e.ServeServersAPI(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST 应返回 405，实际 %d", rec.Code)
 	}

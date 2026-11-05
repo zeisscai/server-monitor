@@ -248,9 +248,9 @@ func (e *Engine) report(c config.Config, rec store.Record, sys collect.SysInfo, 
 func (e *Engine) receiveLoop(ctx context.Context, port int) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/report", e.handleReport)
-	// 对外查询接口与上报接口共用同一个端口：一个写、一个读，
-	// 运维上只需要放行一个端口，开关仍各自独立控制。
-	mux.HandleFunc("/api/servers", e.handleServersAPI)
+	// 数据接收端口上同样提供查询（仅接收功能开启时该端口才会监听）；
+	// Web 端口上另有一份，见 web.Handler。
+	mux.HandleFunc("/api/servers", e.ServeServersAPI)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
@@ -373,12 +373,16 @@ func (e *Engine) handleReport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, true, "")
 }
 
-// handleServersAPI 对外提供「本机存储的全部服务器信息」的只读查询。
+// ServeServersAPI 对外提供「本机存储的全部服务器信息」的只读查询。
 //
-// 与 /api/report 共用端口和鉴权形式，但使用独立的 API-Key：接收 Key 需要
+// 它同时挂在 Web 端口与数据接收端口上：Web 端口是默认入口（只需放行一个端口，
+// 也便于用反向代理加 TLS）；数据接收端口那一路留给只放行该端口的采集网环境。
+// 两个端口上的鉴权、返回体完全一致，用的是同一个 API-Key。
+//
+// 与 /api/report 共用鉴权形式，但使用独立的 API-Key：接收 Key 需要
 // 分发给每一台上报服务器（它们只需写权限），若同时能读全量数据，
 // 任何一台被攻陷的服务器都能拉走整个机群的状况。
-func (e *Engine) handleServersAPI(w http.ResponseWriter, r *http.Request) {
+func (e *Engine) ServeServersAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeJSON(w, http.StatusMethodNotAllowed, false, "仅支持 GET")
 		return

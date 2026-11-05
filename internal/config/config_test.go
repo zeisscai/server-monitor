@@ -235,3 +235,41 @@ func TestUpdatePersistsAndNotifies(t *testing.T) {
 		t.Fatal("配置未持久化")
 	}
 }
+
+// 只有开启数据接收才需要额外监听端口；查询 API 由 Web 端口提供。
+func TestDataPortOpen(t *testing.T) {
+	cases := []struct {
+		receive, api, want bool
+	}{
+		{false, false, false},
+		{true, false, true},
+		{false, true, false},
+		{true, true, true},
+	}
+	for _, tc := range cases {
+		c := Config{ReceiveEnabled: tc.receive, APIEnabled: tc.api}
+		if got := c.DataPortOpen(); got != tc.want {
+			t.Fatalf("receive=%v api=%v：DataPortOpen()=%v，期望 %v", tc.receive, tc.api, got, tc.want)
+		}
+	}
+}
+
+// 只开查询 API 时，接收端口不参与监听，因此允许与 Web 端口相同；
+// 一旦开启数据接收，两个监听器仍必须错开。
+func TestValidateReceivePortOnlyWhenReceiving(t *testing.T) {
+	base := Config{ServerName: "node", WebPort: 8080, ReceivePort: 8080, ReportInterval: 5}
+
+	c := base
+	c.APIEnabled = true
+	c.APIKey = "AAAAAAAAAAAAAAAAAA"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("只开查询 API 时不应因端口相同而报错，实际: %v", err)
+	}
+
+	c = base
+	c.ReceiveEnabled = true
+	c.ReceiveAPIKey = "BBBBBBBBBBBBBBBBBB"
+	if err := c.Validate(); err == nil {
+		t.Fatal("开启数据接收且端口与 Web 相同时应报错")
+	}
+}

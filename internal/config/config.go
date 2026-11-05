@@ -189,9 +189,10 @@ func validInterval(v int) bool {
 
 // DataPortOpen 表示接收端口是否需要监听。
 //
-// 数据接收与对外查询 API 共用同一个端口：任一开启就要监听，
-// 两者都关闭时不对外开放任何端口。
-func (c Config) DataPortOpen() bool { return c.ReceiveEnabled || c.APIEnabled }
+// 只有开启「数据接收」才需要额外开放端口：查询 API 由 Web 端口提供，
+// 因此「只开查询 API」不会让本机多出一个监听端口。
+// 若接收也开着，接收端口上同样能查询（供只放行数据端口的环境使用）。
+func (c Config) DataPortOpen() bool { return c.ReceiveEnabled }
 
 // Normalize 补齐缺失项并纠正非法取值，返回被修正过的配置副本。
 func (c Config) Normalize() Config {
@@ -255,10 +256,12 @@ func (c Config) Validate() error {
 	if c.WebPort <= 0 || c.WebPort > 65535 {
 		return fmt.Errorf("Web 端口必须在 1~65535 之间，当前为 %d", c.WebPort)
 	}
-	if c.ReceiveEnabled || c.APIEnabled {
+	// 查询 API 走 Web 端口，因此只有开启数据接收时才需要校验接收端口。
+	if c.ReceiveEnabled {
 		if c.ReceivePort <= 0 || c.ReceivePort > 65535 {
 			return fmt.Errorf("数据接收端口必须在 1~65535 之间，当前为 %d", c.ReceivePort)
 		}
+		// 两个 HTTP 监听器无法绑定同一端口，必须错开。
 		if c.ReceivePort == c.WebPort {
 			return fmt.Errorf("数据接收端口不能与 Web 端口相同（同为 %d）", c.WebPort)
 		}

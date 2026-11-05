@@ -23,7 +23,7 @@ import (
 
 // version 由 build.sh 通过 -ldflags "-X main.version=..." 注入；
 // 直接 go build 时保留这里的默认值。
-var version = "1.1.0"
+var version = "1.1.1"
 
 var usageText = `服务器监控 (server-monitor) v` + version + `
 

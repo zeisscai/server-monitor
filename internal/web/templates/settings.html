@@ -97,8 +97,9 @@
         </div>
         <p class="muted section-desc">
           开启后，任何持有下列 Key 的一方都可以 <code>GET</code> 本机存储的<strong>全部</strong>服务器数据
-          （含本机）。接口与数据接收共用上面的端口，但使用<strong>独立的 API-Key</strong>——
-          接收 Key 需要分发给每台上报服务器，不应同时具备读取全量数据的权限。
+          （含本机）。接口监听<strong>本页所在的 Web 端口</strong>，不需要额外开放端口；使用
+          <strong>独立的 API-Key</strong>——接收 Key 需要分发给每台上报服务器，
+          不应同时具备读取全量数据的权限。
         </p>
 
         <div class="form-grid dep" data-dep="api">
@@ -108,7 +109,7 @@
               <input type="text" id="api-url" class="mono" value="{{.APIURL}}" readonly>
               <button type="button" class="btn" data-copy="api-url">复制</button>
             </div>
-            <em class="hint">请求头携带 <code>X-API-Key</code>，返回 JSON</em>
+            <em class="hint">请求头携带 <code>X-API-Key</code>，返回 JSON{{if .Cfg.ReceiveEnabled}}；接收端口 <code>{{.Cfg.ReceivePort}}</code> 上也可访问{{end}}</em>
           </div>
 
           <div class="field">

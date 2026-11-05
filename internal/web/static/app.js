@@ -413,12 +413,6 @@
       setDep('receive', !!(receive && receive.checked));
       setDep('api', !!(api && api.checked));
       setDep('report', !!(report && report.checked));
-      // 端口由「数据接收」与「查询 API」共用，任一开启就应可编辑，
-      // 否则只开 API 时端口框会被接收开关一起置灰。
-      var port = $('input[name="receive_port"]');
-      if (port) {
-        port.disabled = !((receive && receive.checked) || (api && api.checked));
-      }
     }
 
     [receive, api, report].forEach(function (cb) {

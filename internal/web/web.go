@@ -93,6 +93,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /settings", s.auth(s.handleSettingsSave))
 	mux.HandleFunc("GET /api/overview", s.auth(s.handleOverview))
 	mux.HandleFunc("GET /api/history", s.auth(s.handleHistory))
+	// 对外查询接口挂在 Web 端口上，走 API-Key 而不是登录会话：
+	// 第三方只需要一个端口、一个 Key，不必接触管理界面的登录体系。
+	mux.HandleFunc("/api/servers", s.eng.ServeServersAPI)
 
 	return securityHeaders(mux)
 }
@@ -443,8 +446,10 @@ func (s *Server) renderSettings(w http.ResponseWriter, r *http.Request, code int
 	if len(ips) > 0 {
 		host = ips[0]
 	}
-	data.APIURL = fmt.Sprintf("http://%s:%d/api/servers", host, c.ReceivePort)
-	if c.DataPortOpen() {
+	// 默认展示 Web 端口上的地址：调用方只需要放行这一个端口。
+	data.APIURL = fmt.Sprintf("http://%s:%d/api/servers", host, c.WebPort)
+	// 数据库占用与「有没有对外服务」无关，任一对外功能开启即可展示。
+	if c.DataPortOpen() || c.APIEnabled {
 		if n, err := s.st.Size(); err == nil {
 			data.DBSize, data.HasDBSz = n, true
 		}
