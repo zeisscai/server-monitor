@@ -892,3 +892,157 @@ func mustJar(t *testing.T, raw string, cookies ...*http.Cookie) http.CookieJar {
 	jar.SetCookies(mustURL(t, raw), cookies)
 	return jar
 }
+
+// ---------- 系统信息与对外查询 API ----------
+
+// 查询 API 的开关在设置页里，独立于数据接收：只开它也要能拿到 Key。
+func TestSettingsQueryAPIToggle(t *testing.T) {
+	h := newHarness(t)
+	client, resp := loginClient(t, h.srv.URL, "admin", "pw123456")
+	readBody(t, resp)
+
+	port := freePort(t)
+	r, err := client.PostForm(h.srv.URL+"/settings", url.Values{
+		"csrf":         {csrfToken(t, client, h.srv.URL)},
+		"server_name":  {"API 节点"},
+		"api_enabled":  {"1"},
+		"receive_port": {fmt.Sprint(port)},
+	})
+	if err != nil {
+		t.Fatalf("保存设置失败: %v", err)
+	}
+	readBody(t, r)
+
+	c := h.cfg.Snapshot()
+	if !c.APIEnabled || len(c.APIKey) != 18 {
+		t.Fatalf("开启查询 API 应生成 18 位 Key: %+v", c)
+	}
+	if c.ReceiveEnabled {
+		t.Fatal("只开查询 API 不应把数据接收也打开")
+	}
+	if c.APIKey == c.ReceiveAPIKey {
+		t.Fatal("两个 Key 不应相同")
+	}
+
+	// 设置页要展示 Key 与可复制的接口地址
+	page, err := client.Get(h.srv.URL + "/settings?saved=1")
+	if err != nil {
+		t.Fatalf("打开设置页失败: %v", err)
+	}
+	html := readBody(t, page)
+	if !strings.Contains(html, c.APIKey) {
+		t.Fatal("设置页未展示查询 API-Key")
+	}
+	if !strings.Contains(html, "/api/servers") {
+		t.Fatal("设置页未展示接口地址")
+	}
+	// 只开查询 API 时也应显示数据库占用（端口确实在监听）
+	if strings.Contains(html, `value="—"`) {
+		t.Fatal("端口已监听时应显示数据库占用")
+	}
+
+	// 关闭后 Key 必须清空
+	off, err := client.PostForm(h.srv.URL+"/settings", url.Values{
+		"csrf":        {csrfToken(t, client, h.srv.URL)},
+		"server_name": {"API 节点"},
+	})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	readBody(t, off)
+	if c := h.cfg.Snapshot(); c.APIEnabled || c.APIKey != "" {
+		t.Fatalf("关闭后应清空查询 Key: %+v", c)
+	}
+}
+
+// 面板与总览接口都应带上发行版 / 内核 / 运行时长。
+func TestOverviewIncludesSysInfo(t *testing.T) {
+	h := newHarness(t)
+	client, resp := loginClient(t, h.srv.URL, "admin", "pw123456")
+	readBody(t, resp)
+
+	remote := "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
+	bootAt := time.Now().Add(-30 * time.Hour).UnixMilli()
+	if err := h.st.Insert(store.Record{
+		ServerUUID: remote, ServerName: "远端节点", CPU: 11.5, Mem: 22.5,
+		Source: store.SourceRemote, CreatedAt: time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatalf("写入记录失败: %v", err)
+	}
+	if err := h.st.UpsertInfo(store.Info{
+		ServerUUID: remote, OS: "Ubuntu 22.04.3 LTS", Kernel: "5.15.0-91-generic", BootAt: bootAt,
+	}); err != nil {
+		t.Fatalf("写入系统信息失败: %v", err)
+	}
+
+	r, err := client.Get(h.srv.URL + "/api/overview")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	body := readBody(t, r)
+	var got struct {
+		OK      bool `json:"ok"`
+		Servers []struct {
+			UUID   string  `json:"uuid"`
+			OS     string  `json:"os"`
+			Kernel string  `json:"kernel"`
+			BootAt int64   `json:"boot_at"`
+			Uptime int64   `json:"uptime"`
+			IsSelf bool    `json:"is_self"`
+			CPU    float64 `json:"cpu"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	var found bool
+	for _, s := range got.Servers {
+		if s.UUID != remote {
+			continue
+		}
+		found = true
+		if s.OS != "Ubuntu 22.04.3 LTS" || s.Kernel != "5.15.0-91-generic" || s.BootAt != bootAt {
+			t.Fatalf("总览缺少系统信息: %+v", s)
+		}
+		if s.Uptime < 30*3600-120 || s.Uptime > 30*3600+120 {
+			t.Fatalf("运行时长推算错误: %d", s.Uptime)
+		}
+		if s.IsSelf {
+			t.Fatal("外来上报不应标记为本机")
+		}
+	}
+	if !found {
+		t.Fatalf("总览应包含该服务器: %s", body)
+	}
+
+	// 详情页要直接渲染出发行版与内核（首屏可见，不依赖 JS）。
+	page, err := client.Get(h.srv.URL + "/server/" + remote)
+	if err != nil {
+		t.Fatalf("打开详情页失败: %v", err)
+	}
+	html := readBody(t, page)
+	for _, want := range []string{"发行版本", "内核版本", "运行时长", "Ubuntu 22.04.3 LTS", "5.15.0-91-generic"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("详情页应包含 %q", want)
+		}
+	}
+}
+
+func TestHumanUptime(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "未知"},
+		{-time.Hour, "未知"},
+		{30 * time.Second, "不足 1 分钟"},
+		{5 * time.Minute, "5 分钟"},
+		{3*time.Hour + 20*time.Minute, "3 小时 20 分"},
+		{49*time.Hour + 5*time.Minute, "2 天 1 小时"},
+	}
+	for _, tc := range cases {
+		if got := HumanUptime(tc.d); got != tc.want {
+			t.Fatalf("HumanUptime(%v) = %q，期望 %q", tc.d, got, tc.want)
+		}
+	}
+}

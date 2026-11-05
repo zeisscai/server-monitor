@@ -53,6 +53,14 @@ func New(cfg *config.Manager, st *store.Store, eng *engine.Engine) (*Server, err
 		},
 		"level": Level,
 		"size":  HumanSize,
+		// uptime 用开机时刻实时推算，页面上永远是最新值，
+		// 不需要前端再去请求一次接口。
+		"uptime": func(bootAt int64) string {
+			if bootAt <= 0 {
+				return "未知"
+			}
+			return HumanUptime(time.Since(time.UnixMilli(bootAt)))
+		},
 	}).ParseFS(tmplFS, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("解析页面模板失败: %w", err)
@@ -327,24 +335,55 @@ func (s *Server) base(r *http.Request, title, active string) baseData {
 	return baseData{Title: title, Cfg: s.cfg.Snapshot(), Active: active, CSRF: s.csrfToken(r)}
 }
 
-func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
-	c := s.cfg.Snapshot()
+// serverView 是面板与总览接口共用的一行数据：最新指标 + 系统信息。
+//
+// 系统信息按 uuid 从 server_info 表关联进来，缺失时字段为空，
+// 页面显示「未知」而不是报错（老版本上报端、第三方接入都可能没有）。
+type serverView struct {
+	store.Latest
+	IsSelf bool   `json:"is_self"`
+	OS     string `json:"os"`
+	Kernel string `json:"kernel"`
+	BootAt int64  `json:"boot_at"`
+	Uptime int64  `json:"uptime"` // 秒
+}
+
+// serverViews 返回所有服务器的最新状态，附带各自的系统信息。
+func (s *Server) serverViews() ([]serverView, error) {
 	latest, err := s.st.Latest()
+	if err != nil {
+		return nil, err
+	}
+	infos, err := s.st.Infos()
+	if err != nil {
+		return nil, err
+	}
+	self := s.cfg.Snapshot().UUID
+	now := time.Now()
+	views := make([]serverView, 0, len(latest))
+	for _, l := range latest {
+		inf := infos[l.ServerUUID]
+		views = append(views, serverView{
+			Latest: l,
+			IsSelf: l.ServerUUID == self,
+			OS:     inf.OS,
+			Kernel: inf.Kernel,
+			BootAt: inf.BootAt,
+			Uptime: int64(inf.UptimeAt(now) / time.Second),
+		})
+	}
+	return views, nil
+}
+
+func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
+	servers, err := s.serverViews()
 	if err != nil {
 		http.Error(w, "查询失败", http.StatusInternalServerError)
 		return
 	}
-	type view struct {
-		store.Latest
-		IsSelf bool
-	}
-	servers := make([]view, 0, len(latest))
-	for _, l := range latest {
-		servers = append(servers, view{Latest: l, IsSelf: l.ServerUUID == c.UUID})
-	}
 	s.render(w, "panel.html", struct {
 		baseData
-		Servers []view
+		Servers []serverView
 	}{s.base(r, "面板", "panel"), servers})
 }
 
@@ -361,12 +400,18 @@ func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
+	inf, err := s.st.Info(uuid)
+	if err != nil {
+		http.Error(w, "查询失败", http.StatusInternalServerError)
+		return
+	}
 	s.render(w, "detail.html", struct {
 		baseData
-		UUID   string
-		Name   string
-		IsSelf bool
-	}{s.base(r, name, "panel"), uuid, name, uuid == c.UUID})
+		UUID string
+		Name string
+		Info store.Info
+		Self bool
+	}{s.base(r, name, "panel"), uuid, name, inf, uuid == c.UUID})
 }
 
 type settingsData struct {
@@ -377,6 +422,7 @@ type settingsData struct {
 	HasDBSz   bool
 	Listening int
 	IPs       []string
+	APIURL    string // 对外查询接口地址示例，便于复制给调用方
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -385,14 +431,20 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) renderSettings(w http.ResponseWriter, r *http.Request, code int, errMsg string, saved bool) {
 	c := s.cfg.Snapshot()
+	ips := LocalIPs()
 	data := settingsData{
 		baseData:  s.base(r, "设置", "settings"),
 		Saved:     saved,
 		ErrorMsg:  errMsg,
 		Listening: s.eng.Running(),
-		IPs:       LocalIPs(),
+		IPs:       ips,
 	}
-	if c.ReceiveEnabled {
+	host := "本机IP"
+	if len(ips) > 0 {
+		host = ips[0]
+	}
+	data.APIURL = fmt.Sprintf("http://%s:%d/api/servers", host, c.ReceivePort)
+	if c.DataPortOpen() {
 		if n, err := s.st.Size(); err == nil {
 			data.DBSize, data.HasDBSz = n, true
 		}
@@ -422,6 +474,8 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 				c.ReceivePort = p
 			}
 		}
+		// 查询 API 的 Key 由后端自动生成，表单只提交开关。
+		c.APIEnabled = r.FormValue("api_enabled") != ""
 
 		c.ReportEnabled = r.FormValue("report_enabled") != ""
 		if _, ok := r.Form["report_target_ip"]; ok {
@@ -452,26 +506,18 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 // ---------- 接口 ----------
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
-	latest, err := s.st.Latest()
+	servers, err := s.serverViews()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "查询失败"})
 		return
 	}
 	c := s.cfg.Snapshot()
-	type item struct {
-		store.Latest
-		IsSelf bool `json:"is_self"`
-	}
-	items := make([]item, 0, len(latest))
-	for _, l := range latest {
-		items = append(items, item{Latest: l, IsSelf: l.ServerUUID == c.UUID})
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
 		"self":     c.UUID,
 		"selfName": c.ServerName,
 		"now":      time.Now().UnixMilli(),
-		"servers":  items,
+		"servers":  servers,
 	})
 }
 
@@ -638,6 +684,30 @@ func Level(v float64) string {
 		return "warn"
 	default:
 		return "ok"
+	}
+}
+
+// HumanUptime 把运行时长格式化为「12 天 3 小时」这类易读形式。
+//
+// 只保留两级单位：运行时长精确到秒没有意义，
+// 也没有人会把「87 天 4 小时 12 分 33 秒」读完。
+func HumanUptime(d time.Duration) string {
+	if d <= 0 {
+		return "未知"
+	}
+	total := int(d.Hours())
+	days := total / 24
+	hours := total % 24
+	mins := int(d.Minutes()) % 60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%d 天 %d 小时", days, hours)
+	case hours > 0:
+		return fmt.Sprintf("%d 小时 %d 分", hours, mins)
+	case mins > 0:
+		return fmt.Sprintf("%d 分钟", mins)
+	default:
+		return "不足 1 分钟"
 	}
 }
 

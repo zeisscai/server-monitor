@@ -79,8 +79,58 @@
           <em class="hint">SQLite 历史数据永久保留，不做清理</em>
           {{else}}
           <input type="text" value="—" readonly>
-          <em class="hint">开启数据接收后显示</em>
+          <em class="hint">开启数据接收或查询 API 后显示</em>
           {{end}}
+        </div>
+      </div>
+
+      <div class="sub-feature">
+        <div class="sub-head">
+          <h3>对外查询 API
+            {{if .Cfg.APIEnabled}}<span class="pill pill-ok"><i class="dot dot-ok"></i> 已开启</span>
+            {{else}}<span class="pill"><i class="dot dot-off"></i> 已关闭</span>{{end}}
+          </h3>
+          <label class="switch">
+            <input type="checkbox" name="api_enabled" id="api_enabled" {{if .Cfg.APIEnabled}}checked{{end}}>
+            <span class="slider"></span>
+          </label>
+        </div>
+        <p class="muted section-desc">
+          开启后，任何持有下列 Key 的一方都可以 <code>GET</code> 本机存储的<strong>全部</strong>服务器数据
+          （含本机）。接口与数据接收共用上面的端口，但使用<strong>独立的 API-Key</strong>——
+          接收 Key 需要分发给每台上报服务器，不应同时具备读取全量数据的权限。
+        </p>
+
+        <div class="form-grid dep" data-dep="api">
+          <div class="field">
+            <span>接口地址</span>
+            <div class="copy-row">
+              <input type="text" id="api-url" class="mono" value="{{.APIURL}}" readonly>
+              <button type="button" class="btn" data-copy="api-url">复制</button>
+            </div>
+            <em class="hint">请求头携带 <code>X-API-Key</code>，返回 JSON</em>
+          </div>
+
+          <div class="field">
+            <span>查询 API-Key</span>
+            {{if .Cfg.APIKey}}
+            <div class="copy-row">
+              <input type="text" id="api-key" class="mono" value="{{.Cfg.APIKey}}" readonly>
+              <button type="button" class="btn" data-copy="api-key">复制</button>
+            </div>
+            <em class="hint">18 位，开启时自动生成；关闭后清空，重新开启会换新 Key</em>
+            {{else}}
+            <input type="text" id="api-key" class="mono" value="" placeholder="开启并保存后自动生成" readonly>
+            <em class="hint">开启该功能并保存后，将自动生成一个 18 位 API-Key</em>
+            {{end}}
+          </div>
+
+          <div class="field">
+            <span>调用示例</span>
+            <input type="text" class="mono" readonly
+                   value="curl -H 'X-API-Key: {{if .Cfg.APIKey}}{{.Cfg.APIKey}}{{else}}<KEY>{{end}}' {{.APIURL}}">
+            <em class="hint">也支持 <code>Authorization: Bearer &lt;KEY&gt;</code>；不支持把 Key 放在 URL 参数里</em>
+          </div>
         </div>
       </div>
     </section>

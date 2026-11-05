@@ -114,6 +114,10 @@ type Config struct {
 	ReceivePort    int    `json:"receive_port"`
 	ReceiveAPIKey  string `json:"receive_api_key"` // 18 位，打开接收功能时自动生成，只读
 
+	// 对外查询 API（GET /api/servers），与数据接收共用端口，但开关与 Key 独立
+	APIEnabled bool   `json:"api_enabled"` // 默认关闭
+	APIKey     string `json:"api_key"`     // 18 位，打开查询 API 时自动生成，只读
+
 	// 数据上报
 	ReportEnabled    bool   `json:"report_enabled"`
 	ReportTargetIP   string `json:"report_target_ip"`
@@ -183,6 +187,12 @@ func validInterval(v int) bool {
 	return false
 }
 
+// DataPortOpen 表示接收端口是否需要监听。
+//
+// 数据接收与对外查询 API 共用同一个端口：任一开启就要监听，
+// 两者都关闭时不对外开放任何端口。
+func (c Config) DataPortOpen() bool { return c.ReceiveEnabled || c.APIEnabled }
+
 // Normalize 补齐缺失项并纠正非法取值，返回被修正过的配置副本。
 func (c Config) Normalize() Config {
 	if !IsUUID(c.UUID) {
@@ -216,6 +226,13 @@ func (c Config) Normalize() Config {
 	} else if len(c.ReceiveAPIKey) != 18 {
 		c.ReceiveAPIKey = NewAPIKey()
 	}
+	// 查询 API 与接收功能共用端口，但 Key 独立：接收 Key 会分发给每一台
+	// 上报服务器（只需写权限），不能让它同时具备读全量数据的能力。
+	if !c.APIEnabled {
+		c.APIKey = ""
+	} else if len(c.APIKey) != 18 {
+		c.APIKey = NewAPIKey()
+	}
 	if !validInterval(c.ReportInterval) {
 		c.ReportInterval = DefaultReportInterval
 	}
@@ -238,7 +255,7 @@ func (c Config) Validate() error {
 	if c.WebPort <= 0 || c.WebPort > 65535 {
 		return fmt.Errorf("Web 端口必须在 1~65535 之间，当前为 %d", c.WebPort)
 	}
-	if c.ReceiveEnabled {
+	if c.ReceiveEnabled || c.APIEnabled {
 		if c.ReceivePort <= 0 || c.ReceivePort > 65535 {
 			return fmt.Errorf("数据接收端口必须在 1~65535 之间，当前为 %d", c.ReceivePort)
 		}

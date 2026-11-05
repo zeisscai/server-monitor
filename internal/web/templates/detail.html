@@ -5,10 +5,29 @@
   <div class="page-head">
     <div>
       <a class="back" href="/">← 返回面板</a>
-      <h1>{{.Name}}{{if .IsSelf}} <span class="badge badge-self">本机</span>{{end}}</h1>
+      <h1>{{.Name}}{{if .Self}} <span class="badge badge-self">本机</span>{{end}}</h1>
       <p class="muted mono">{{.UUID}}</p>
     </div>
   </div>
+
+  <section class="meta-grid">
+    <div class="meta">
+      <span class="k">发行版本</span>
+      <span class="v">{{if .Info.OS}}{{.Info.OS}}{{else}}未知{{end}}</span>
+    </div>
+    <div class="meta">
+      <span class="k">内核版本</span>
+      <span class="v mono">{{if .Info.Kernel}}{{.Info.Kernel}}{{else}}未知{{end}}</span>
+    </div>
+    <div class="meta">
+      <span class="k">运行时长</span>
+      <span class="v"{{if .Info.BootAt}} data-boot="{{.Info.BootAt}}"{{end}}>{{uptime .Info.BootAt}}</span>
+    </div>
+    <div class="meta">
+      <span class="k">信息更新于</span>
+      <span class="v mono">{{ts .Info.UpdatedAt}}</span>
+    </div>
+  </section>
 
   <div class="range-bar">
     <button class="range" data-range="1h">最近 1 小时</button>
@@ -59,4 +78,4 @@
   </section>
 </main>
 {{template "foot" .}}
-<div id="detail-meta" data-uuid="{{.UUID}}" data-self="{{.IsSelf}}" hidden></div>
+<div id="detail-meta" data-uuid="{{.UUID}}" data-self="{{.Self}}" hidden></div>

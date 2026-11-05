@@ -7,10 +7,14 @@
 // 便于在开发机上验证整体流程。
 package collect
 
-// Sample 是一次采集结果，取值均为百分比（0 ~ 100）。
+// Sample 是一次采集结果。
+//
+// CPU / Mem 是百分比（0 ~ 100）；Sys 是发行版 / 内核 / 开机时刻这类
+// 低频变化的信息，由采集器内部缓存，不必随每次上报发出。
 type Sample struct {
 	CPU float64
 	Mem float64
+	Sys SysInfo
 }
 
 func clamp(v float64) float64 {

@@ -10,16 +10,20 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Sampler 通过系统命令读取系统指标。
-type Sampler struct{}
+type Sampler struct {
+	sys sysCache
+}
 
 // New 创建采集器。
 func New() *Sampler { return &Sampler{} }
 
 // Read 返回本次采样结果。
 func (s *Sampler) Read() (Sample, error) {
+	now := time.Now()
 	cpu, err := readCPUUsage()
 	if err != nil {
 		return Sample{}, err
@@ -28,7 +32,7 @@ func (s *Sampler) Read() (Sample, error) {
 	if err != nil {
 		return Sample{}, err
 	}
-	return Sample{CPU: round1(clamp(cpu)), Mem: round1(clamp(mem))}, nil
+	return Sample{CPU: round1(clamp(cpu)), Mem: round1(clamp(mem)), Sys: s.sys.get(now)}, nil
 }
 
 func readCPUUsage() (float64, error) {

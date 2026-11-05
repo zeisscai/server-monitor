@@ -30,6 +30,11 @@
         <span class="metric-val">{{pct .Mem}}%</span>
       </div>
       <div class="bar"><i class="fill" data-level="{{level .Mem}}" style="width:{{pct .Mem}}%"></i></div>
+      <div class="srv-sys">
+        <span class="srv-os" title="{{.OS}}">{{if .OS}}{{.OS}}{{else}}系统信息未知{{end}}</span>
+        {{if .Kernel}}<span class="dotsep">·</span><span class="mono srv-kernel" title="{{.Kernel}}">{{.Kernel}}</span>{{end}}
+        {{if .BootAt}}<span class="dotsep">·</span><span>运行 <b data-boot="{{.BootAt}}">{{uptime .BootAt}}</b></span>{{end}}
+      </div>
       <div class="srv-foot">
         <span class="muted" data-ts="{{.CreatedAt}}">更新于 {{ts .CreatedAt}}</span>
         <span class="chev">›</span>

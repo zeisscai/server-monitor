@@ -382,3 +382,98 @@ func TestInsertAfterClose(t *testing.T) {
 		t.Fatalf("重复关闭不应报错: %v", err)
 	}
 }
+
+func TestUpsertInfo(t *testing.T) {
+	s := newTestStore(t)
+	boot := time.Now().Add(-5 * time.Hour).UnixMilli()
+
+	if err := s.UpsertInfo(Info{ServerUUID: uuidA, OS: "Ubuntu 22.04.3 LTS", Kernel: "5.15.0-91-generic", BootAt: boot}); err != nil {
+		t.Fatalf("写入系统信息失败: %v", err)
+	}
+	inf, err := s.Info(uuidA)
+	if err != nil {
+		t.Fatalf("查询失败: %v", err)
+	}
+	if inf.OS != "Ubuntu 22.04.3 LTS" || inf.Kernel != "5.15.0-91-generic" || inf.BootAt != boot {
+		t.Fatalf("系统信息不正确: %+v", inf)
+	}
+	if inf.UpdatedAt == 0 {
+		t.Fatal("应自动补上更新时间")
+	}
+
+	// 只带部分字段时，未带的字段必须保持不变（内存升级后只需补内核）。
+	if err := s.UpsertInfo(Info{ServerUUID: uuidA, Kernel: "6.1.0-13-amd64"}); err != nil {
+		t.Fatalf("更新失败: %v", err)
+	}
+	inf2, err := s.Info(uuidA)
+	if err != nil {
+		t.Fatalf("查询失败: %v", err)
+	}
+	if inf2.Kernel != "6.1.0-13-amd64" {
+		t.Fatalf("内核应被更新，实际 %q", inf2.Kernel)
+	}
+	if inf2.OS != inf.OS || inf2.BootAt != boot {
+		t.Fatalf("未提供的字段不应被清空: %+v", inf2)
+	}
+
+	// 空识别码必须拒绝，避免写出无法关联的孤儿行。
+	if err := s.UpsertInfo(Info{OS: "x"}); err == nil {
+		t.Fatal("空识别码应返回错误")
+	}
+
+	// 没有记录的服务器应返回零值而非错误。
+	unknown, err := s.Info(uuidB)
+	if err != nil {
+		t.Fatalf("查询未知服务器不应报错: %v", err)
+	}
+	if unknown.OS != "" || unknown.BootAt != 0 {
+		t.Fatalf("未知服务器应返回零值: %+v", unknown)
+	}
+
+	// Infos 返回全量映射，供面板一次性关联。
+	if err := s.UpsertInfo(Info{ServerUUID: uuidB, OS: "Debian 12", BootAt: boot}); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	all, err := s.Infos()
+	if err != nil {
+		t.Fatalf("Infos 失败: %v", err)
+	}
+	if len(all) != 2 || all[uuidB].OS != "Debian 12" || all[uuidA].Kernel != "6.1.0-13-amd64" {
+		t.Fatalf("Infos 内容不正确: %+v", all)
+	}
+}
+
+// 系统信息与采样记录共用一条写入队列，混在一起写也不能互相干扰。
+func TestUpsertInfoMixedWithRecords(t *testing.T) {
+	s := newTestStore(t)
+	base := time.Now().Add(-time.Minute).UnixMilli()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			_ = s.Insert(Record{ServerUUID: uuidA, ServerName: "A", CPU: 1, Mem: 2, CreatedAt: base + int64(i)})
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			_ = s.UpsertInfo(Info{ServerUUID: uuidA, OS: "Ubuntu 22.04", BootAt: base})
+		}(i)
+	}
+	wg.Wait()
+
+	n, err := s.Count()
+	if err != nil {
+		t.Fatalf("Count 失败: %v", err)
+	}
+	if n != 20 {
+		t.Fatalf("应写入 20 条记录，实际 %d", n)
+	}
+	inf, err := s.Info(uuidA)
+	if err != nil {
+		t.Fatalf("查询失败: %v", err)
+	}
+	if inf.OS != "Ubuntu 22.04" || inf.BootAt != base {
+		t.Fatalf("系统信息不正确: %+v", inf)
+	}
+}

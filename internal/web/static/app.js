@@ -43,6 +43,18 @@
     return Math.floor(h / 24) + ' 天前';
   }
 
+  /* 运行时长：由开机时刻推算，只保留两级单位 */
+  function fmtUptime(sec) {
+    if (!sec || sec <= 0) return '未知';
+    var d = Math.floor(sec / 86400);
+    var h = Math.floor((sec % 86400) / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    if (d > 0) return d + ' 天 ' + h + ' 小时';
+    if (h > 0) return h + ' 小时 ' + m + ' 分';
+    if (m > 0) return m + ' 分钟';
+    return '不足 1 分钟';
+  }
+
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -54,12 +66,20 @@
     return '<span class="src src-local">本机</span>';
   }
 
-  /* ---------------- 相对时间：每秒刷新 ---------------- */
+  /* ---------------- 相对时间 / 运行时长：每秒刷新 ---------------- */
   function tickRelative() {
     $$('[data-ts]').forEach(function (el) {
       var ms = Number(el.getAttribute('data-ts')) || 0;
       var prefix = el.getAttribute('data-ts-prefix');
       el.textContent = (prefix || '') + relTime(ms);
+    });
+  }
+
+  function tickUptime() {
+    $$('[data-boot]').forEach(function (el) {
+      var boot = Number(el.getAttribute('data-boot')) || 0;
+      if (!boot) return;
+      el.textContent = fmtUptime((Date.now() - boot) / 1000);
     });
   }
 
@@ -71,6 +91,20 @@
            '" style="width:' + Math.max(0, Math.min(100, value)) + '%"></i></div>';
   }
 
+  function sysLine(s) {
+    var parts = ['<span class="srv-os" title="' + esc(s.os) + '">' +
+      (s.os ? esc(s.os) : '系统信息未知') + '</span>'];
+    if (s.kernel) {
+      parts.push('<span class="dotsep">·</span><span class="mono srv-kernel" title="' +
+        esc(s.kernel) + '">' + esc(s.kernel) + '</span>');
+    }
+    if (s.boot_at) {
+      parts.push('<span class="dotsep">·</span><span>运行 <b data-boot="' + s.boot_at + '">' +
+        fmtUptime(s.uptime) + '</b></span>');
+    }
+    return '<div class="srv-sys">' + parts.join('') + '</div>';
+  }
+
   function cardHTML(s) {
     var name = esc(s.name || s.uuid);
     return '<a class="srv-card" href="/server/' + esc(s.uuid) + '" data-uuid="' + esc(s.uuid) + '">' +
@@ -78,6 +112,7 @@
       '<span class="badge ' + (s.is_self ? 'badge-self' : 'badge-remote') + '">' +
       (s.is_self ? '本机' : '外来上报') + '</span></div>' +
       metricBlock('CPU 占用', s.cpu) + metricBlock('内存占用', s.mem) +
+      sysLine(s) +
       '<div class="srv-foot"><span class="muted" data-ts-prefix="更新于 " data-ts="' + s.ts + '">更新于 ' +
       relTime(s.ts) + '</span><span class="chev">›</span></div></a>';
   }
@@ -101,6 +136,7 @@
           if (empty) empty.hidden = list.length > 0;
           if (count) count.textContent = list.length;
           tickRelative();
+          tickUptime();
         })
         .catch(function () {})
         .then(function () { busy = false; });
@@ -110,8 +146,8 @@
     if (btn) btn.addEventListener('click', function (e) { e.preventDefault(); refresh(); });
 
     setInterval(refresh, 5000);
-    setInterval(tickRelative, 1000);
     tickRelative();
+    tickUptime();
   }
 
   /* ---------------- 服务器详情 ---------------- */
@@ -359,20 +395,36 @@
     var form = $('.settings-form');
     if (!form) return;
 
-    [['receive_enabled', 'receive'], ['report_enabled', 'report']].forEach(function (pair) {
-      var cb = document.getElementById(pair[0]);
-      var dep = $('.dep[data-dep="' + pair[1] + '"]');
-      if (!cb || !dep) return;
-      function sync() {
-        dep.classList.toggle('dim', !cb.checked);
-        $$('input, select', dep).forEach(function (el) {
-          if (el.readOnly) return;
-          el.disabled = !cb.checked;
-        });
+    var receive = document.getElementById('receive_enabled');
+    var api = document.getElementById('api_enabled');
+    var report = document.getElementById('report_enabled');
+
+    function setDep(name, on) {
+      var dep = $('.dep[data-dep="' + name + '"]');
+      if (!dep) return;
+      dep.classList.toggle('dim', !on);
+      $$('input, select', dep).forEach(function (el) {
+        if (el.readOnly) return;
+        el.disabled = !on;
+      });
+    }
+
+    function sync() {
+      setDep('receive', !!(receive && receive.checked));
+      setDep('api', !!(api && api.checked));
+      setDep('report', !!(report && report.checked));
+      // 端口由「数据接收」与「查询 API」共用，任一开启就应可编辑，
+      // 否则只开 API 时端口框会被接收开关一起置灰。
+      var port = $('input[name="receive_port"]');
+      if (port) {
+        port.disabled = !((receive && receive.checked) || (api && api.checked));
       }
-      cb.addEventListener('change', sync);
-      sync();
+    }
+
+    [receive, api, report].forEach(function (cb) {
+      if (cb) cb.addEventListener('change', sync);
     });
+    sync();
 
     $$('[data-copy]').forEach(function (btn) {
       btn.addEventListener('click', function () {
@@ -417,5 +469,9 @@
     initPanel();
     initDetail();
     initSettings();
+    // 相对时间与运行时长统一由一个秒级定时器推进，面板与详情页都受益。
+    tickRelative();
+    tickUptime();
+    setInterval(function () { tickRelative(); tickUptime(); }, 1000);
   });
 })();

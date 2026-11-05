@@ -12,6 +12,7 @@ type Sampler struct {
 	prevIdle  uint64
 	prevTotal uint64
 	primed    bool
+	sys       sysCache
 }
 
 // New 创建采集器。
@@ -20,6 +21,7 @@ func New() *Sampler { return &Sampler{} }
 // Read 返回本次采样结果。
 // 首次调用会先取一次基线并短暂等待，以便直接得到有意义的 CPU 占用率。
 func (s *Sampler) Read() (Sample, error) {
+	now := time.Now()
 	idle, total, err := readCPUTimes()
 	if err != nil {
 		return Sample{}, err
@@ -45,6 +47,7 @@ func (s *Sampler) Read() (Sample, error) {
 	return Sample{
 		CPU: round1(clamp(cpuPercent(dIdle, dTotal))),
 		Mem: round1(clamp(usagePercent(totalKB, availKB))),
+		Sys: s.sys.get(now),
 	}, nil
 }
 

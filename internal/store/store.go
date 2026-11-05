@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -71,6 +72,29 @@ type Latest struct {
 	Count      int64   `json:"count"`
 }
 
+// Info 是某台服务器的系统信息：发行版本、内核版本与开机时刻。
+//
+// 单独建表而不是塞进 records / server_latest：这些值只在系统升级或
+// 重启时变化，逐条记录都存一份纯属浪费，而且会让最新值表的热路径变宽。
+type Info struct {
+	ServerUUID string `json:"uuid"`
+	OS         string `json:"os"`      // 发行版本，如 "Ubuntu 22.04.3 LTS"
+	Kernel     string `json:"kernel"`  // 内核版本，如 "5.15.0-91-generic"
+	BootAt     int64  `json:"boot_at"` // 开机时刻（Unix 毫秒），0 表示未知
+	UpdatedAt  int64  `json:"info_ts"` // 该信息的接收 / 采集时间
+}
+
+// UptimeAt 返回 now 时刻的运行时长；开机时刻未知时返回 0。
+func (i Info) UptimeAt(now time.Time) time.Duration {
+	if i.BootAt <= 0 {
+		return 0
+	}
+	if d := now.Sub(time.UnixMilli(i.BootAt)); d > 0 {
+		return d
+	}
+	return 0
+}
+
 // Point 是曲线上的一个聚合点。
 type Point struct {
 	T   int64   `json:"t"`
@@ -99,6 +123,7 @@ type Store struct {
 	ins    *sql.Stmt
 	latest *sql.Stmt
 	incr   *sql.Stmt
+	upsert *sql.Stmt
 
 	mu     sync.RWMutex // 保护 closed 与入队，避免向已关闭的 channel 发送
 	closed bool
@@ -108,10 +133,13 @@ type Store struct {
 	batch   []writeOp
 	agg     map[string]*aggEntry
 	aggKeys []string
+	recs    []Record
+	infos   []Info
 }
 
 type writeOp struct {
 	rec  Record
+	info *Info // 非空表示这是一条系统信息写入
 	done chan error
 }
 
@@ -142,6 +170,13 @@ CREATE TABLE IF NOT EXISTS server_latest (
 	cnt         INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_latest_time ON server_latest (created_at);
+CREATE TABLE IF NOT EXISTS server_info (
+	server_uuid TEXT    PRIMARY KEY,
+	os_name     TEXT    NOT NULL DEFAULT '',
+	kernel      TEXT    NOT NULL DEFAULT '',
+	boot_at     INTEGER NOT NULL DEFAULT 0,
+	updated_at  INTEGER NOT NULL DEFAULT 0
+);
 `
 
 // Open 打开（必要时创建）数据库文件并初始化表结构。
@@ -233,6 +268,19 @@ func (s *Store) init() error {
 	if err != nil {
 		return fmt.Errorf("准备计数语句失败: %w", err)
 	}
+	// 只覆盖本次确实带到的字段：上报端可能只补发部分信息（例如只换了内核），
+	// 用空值把已有内容抹掉是错误的。
+	s.upsert, err = conn.PrepareContext(ctx, `
+		INSERT INTO server_info (server_uuid, os_name, kernel, boot_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(server_uuid) DO UPDATE SET
+			os_name    = CASE WHEN excluded.os_name <> '' THEN excluded.os_name ELSE server_info.os_name END,
+			kernel     = CASE WHEN excluded.kernel  <> '' THEN excluded.kernel  ELSE server_info.kernel  END,
+			boot_at    = CASE WHEN excluded.boot_at <> 0  THEN excluded.boot_at ELSE server_info.boot_at END,
+			updated_at = excluded.updated_at`)
+	if err != nil {
+		return fmt.Errorf("准备系统信息语句失败: %w", err)
+	}
 	return s.backfillLatest()
 }
 
@@ -311,8 +359,29 @@ func (s *Store) InsertBatch(rows []Record) error {
 	return s.flush(ops)
 }
 
+// UpsertInfo 写入或更新某台服务器的系统信息。
+//
+// 与历史记录走同一条写入队列：SQLite 只允许一个写者，这样不必额外加锁，
+// 也不会与批提交互相阻塞在 BEGIN 上。该调用频率极低（每台服务器一次 / 半小时）。
+func (s *Store) UpsertInfo(inf Info) error {
+	inf.ServerUUID = strings.TrimSpace(inf.ServerUUID)
+	if inf.ServerUUID == "" {
+		return errors.New("服务器识别码不能为空")
+	}
+	if inf.UpdatedAt == 0 {
+		inf.UpdatedAt = time.Now().UnixMilli()
+	}
+	done := make(chan error, 1)
+	if err := s.enqueue(writeOp{info: &inf, done: done}); err != nil {
+		return err
+	}
+	return <-done
+}
+
 func (s *Store) enqueue(op writeOp) error {
-	op.rec = normalize(op.rec)
+	if op.info == nil {
+		op.rec = normalize(op.rec)
+	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -377,7 +446,7 @@ func (s *Store) writer() {
 	}
 }
 
-// flush 在一个事务里写入整批记录，并维护 server_latest。
+// flush 在一个事务里写入整批记录，并维护 server_latest 与 server_info。
 func (s *Store) flush(batch []writeOp) error {
 	if len(batch) == 0 {
 		return nil
@@ -385,10 +454,20 @@ func (s *Store) flush(batch []writeOp) error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 
+	// 先把两类写入分开：记录需要按 uuid 聚合，系统信息逐条 upsert。
+	recs := s.recs[:0]
+	infos := s.infos[:0]
+	for i := range batch {
+		if inf := batch[i].info; inf != nil {
+			infos = append(infos, *inf)
+			continue
+		}
+		recs = append(recs, batch[i].rec)
+	}
+
 	// 同批次内按 uuid 聚合：latest 只写一条（取时间最新的），计数累加。
 	keys := s.aggKeys[:0]
-	for i := range batch {
-		r := batch[i].rec
+	for _, r := range recs {
 		e := s.agg[r.ServerUUID]
 		if e == nil {
 			e = &aggEntry{}
@@ -401,21 +480,26 @@ func (s *Store) flush(batch []writeOp) error {
 		}
 	}
 
-	err := s.commit(batch, keys)
+	err := s.commit(recs, keys, infos)
 	for _, k := range keys {
 		delete(s.agg, k)
 	}
 	s.aggKeys = keys[:0]
+	s.recs = recs[:0]
+	for i := range infos {
+		infos[i] = Info{}
+	}
+	s.infos = infos[:0]
 	return err
 }
 
-func (s *Store) commit(batch []writeOp, keys []string) error {
+func (s *Store) commit(recs []Record, keys []string, infos []Info) error {
 	ctx := context.Background()
 	if _, err := s.wconn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return err
 	}
-	for i := range batch {
-		r := batch[i].rec
+	for i := range recs {
+		r := recs[i]
 		if _, err := s.ins.ExecContext(ctx, r.ServerUUID, r.ServerName, r.CPU, r.Mem, r.Source, r.CreatedAt); err != nil {
 			_, _ = s.wconn.ExecContext(ctx, "ROLLBACK")
 			return err
@@ -428,6 +512,12 @@ func (s *Store) commit(batch []writeOp, keys []string) error {
 			return err
 		}
 		if _, err := s.incr.ExecContext(ctx, e.n, k); err != nil {
+			_, _ = s.wconn.ExecContext(ctx, "ROLLBACK")
+			return err
+		}
+	}
+	for _, inf := range infos {
+		if _, err := s.upsert.ExecContext(ctx, inf.ServerUUID, inf.OS, inf.Kernel, inf.BootAt, inf.UpdatedAt); err != nil {
 			_, _ = s.wconn.ExecContext(ctx, "ROLLBACK")
 			return err
 		}
@@ -491,6 +581,40 @@ func (s *Store) Name(uuid string) (string, error) {
 		return "", nil
 	}
 	return name, err
+}
+
+// Infos 返回所有已登记的服务器系统信息，键为服务器识别码。
+//
+// 这张表每台服务器最多一行，因此可以整表读出来与 Latest 做内存关联，
+// 不必在 SQL 里 JOIN（面板每 5 秒刷新一次，能省则省）。
+func (s *Store) Infos() (map[string]Info, error) {
+	rows, err := s.db.Query(`SELECT server_uuid, os_name, kernel, boot_at, updated_at FROM server_info`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]Info)
+	for rows.Next() {
+		var inf Info
+		if err := rows.Scan(&inf.ServerUUID, &inf.OS, &inf.Kernel, &inf.BootAt, &inf.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out[inf.ServerUUID] = inf
+	}
+	return out, rows.Err()
+}
+
+// Info 返回某台服务器的系统信息；没有记录时返回零值（不视为错误）。
+func (s *Store) Info(uuid string) (Info, error) {
+	inf := Info{ServerUUID: uuid}
+	err := s.db.QueryRow(
+		`SELECT os_name, kernel, boot_at, updated_at FROM server_info WHERE server_uuid = ?`, uuid,
+	).Scan(&inf.OS, &inf.Kernel, &inf.BootAt, &inf.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return inf, nil
+	}
+	return inf, err
 }
 
 // History 返回时间范围内的历史记录（按时间正序，最多 limit 条）。
