@@ -134,6 +134,19 @@ SELF="${BASH_SOURCE[0]:-$0}"
 ARGS=("$@")
 SELF_TMP=""
 
+# 判断某个文件是否是一份内容完整的本脚本。
+#
+# 必须校验内容而不能只看大小：`bash <(curl ...)` 时脚本挂在管道上，
+# 而 bash 已经把管道读到了尾部，`cat /dev/fd/NN` 复制出来是**空文件**（实测 0 字节），
+# cat 却返回成功——于是 sudo 会去执行一个空脚本，表现为「输入密码后什么都没发生」。
+script_sane() {
+  local f="$1"
+  [ -s "$f" ] || return 1
+  grep -q 'APP_NAME="server-monitor"' "$f" 2>/dev/null || return 1
+  grep -q '^main "\$@"' "$f" 2>/dev/null || return 1
+  return 0
+}
+
 reexec_root() {
   [ "$(id -u)" -eq 0 ] && return 0
   if [ "${SMD_TEST_MODE:-0}" = "1" ]; then
@@ -142,16 +155,25 @@ reexec_root() {
   fi
   command -v sudo >/dev/null 2>&1 || die "需要 root 权限，且系统没有 sudo。请用 root 账户执行。"
 
-  # `bash <(curl ...)` 时脚本路径是 /dev/fd/NN，sudo 起的子进程读不到这个 fd，
-  # 先落一份临时副本再提权。
   local self="$SELF"
-  if [ ! -f "$self" ] || [ ! -r "$self" ]; then
+  if [ -f "$self" ] && [ -r "$self" ]; then
+    : # 常规情况：脚本已在磁盘上（sudo bash install.sh）
+  else
+    # 通过 `bash <(curl ...)` 或 `curl | bash` 启动：脚本没有磁盘副本。
+    # 先试着复制自身（某些 bash 版本仍可读），复制出来不完整就重新下载。
     SELF_TMP="$(mktemp "${TMPDIR:-/tmp}/smd-install.XXXXXX")" || die "无法创建临时文件"
-    if ! cat "$SELF" >"$SELF_TMP" 2>/dev/null; then
-      dl_to "$RAW_URL" "$SELF_TMP" || die "无法准备提权所需的脚本副本，请手动下载后运行"
-    fi
     self="$SELF_TMP"
     trap 'rm -f "$SELF_TMP"' EXIT
+
+    cat "$SELF" >"$self" 2>/dev/null || true
+    if ! script_sane "$self"; then
+      info "脚本未落盘，正在获取一份完整副本用于提权…"
+      if ! dl_to "${SMD_MIRROR:-}${RAW_URL}" "$self" || ! script_sane "$self"; then
+        # 下载也失败时给一条能直接照抄的命令，而不是留一个看不懂的错误。
+        die "无法准备提权所需的脚本副本。请改用：
+      curl -fsSL ${RAW_URL} -o /tmp/install.sh && sudo bash /tmp/install.sh"
+      fi
+    fi
   fi
   printf '%s需要管理员权限，正在通过 sudo 重新执行…%s\n' "$C_D" "$C_0"
   # 不用 sudo -E：多数发行版默认禁止保留环境变量。需要传递的配置逐项显式带入。
