@@ -177,11 +177,15 @@ reexec_root() {
   fi
   printf '%s需要管理员权限，正在通过 sudo 重新执行…%s\n' "$C_D" "$C_0"
   # 不用 sudo -E：多数发行版默认禁止保留环境变量。需要传递的配置逐项显式带入。
-  exec sudo env \
+  # 这里也不用 exec：exec 会跳过 EXIT trap，临时副本就没人清理了。
+  local rc=0
+  sudo env \
     SMD_MIRROR="${SMD_MIRROR:-}" \
     SMD_APP_DIR="$APP_DIR" \
     SMD_REPO="$REPO" \
-    bash "$self" ${ARGS[@]+"${ARGS[@]}"}
+    bash "$self" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
+  [ -n "${SELF_TMP:-}" ] && rm -f "$SELF_TMP"
+  exit "$rc"
 }
 
 # ---------------- 下载 ----------------
