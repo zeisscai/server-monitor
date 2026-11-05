@@ -61,14 +61,27 @@ go build -o server-monitor .
 
 ### 2.3 部署到服务器（推荐：一行命令）
 
-**不需要先下载任何文件**，在服务器终端（root 或 sudo 账户）直接执行：
+**不需要先下载任何文件**，在服务器终端直接执行（普通用户即可，脚本会自己调 sudo）：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/zeisscai/server-monitor/main/install.sh)
 ```
 
-脚本会自动识别 CPU 架构（amd64 / arm64 / armv7）、从 GitHub Release 下载对应版本、
-校验 SHA-256，然后进入菜单：
+三种等价写法，按你的习惯选一种即可：
+
+| 写法 | 说明 |
+| --- | --- |
+| `bash <(curl -fsSL <URL>)` | **推荐**。以普通用户运行，脚本内部再提权，权限最小化 |
+| `curl -fsSL <URL> \| sudo bash` | 已经是 root 或习惯显式提权时用这个 |
+| `sudo bash install.sh` | 先把脚本下载到本地，再用 sudo 执行 |
+
+> ⚠️ **不要写成 `sudo bash <(curl ...)`**。`sudo` 默认会关闭继承来的文件描述符，
+> bash 在新进程里打不开那个 `/dev/fd/63`，于是报
+> `bash: /dev/fd/63: No such file or directory`，同时 `curl` 因为管道无人读取报
+> `curl: (23) Failure writing output to destination`。这不是脚本或网络的问题，
+> 换成上面任意一种写法即可（详见 11.5）。
+
+脚本进入菜单：
 
 ```
   1) 全新安装
@@ -669,6 +682,34 @@ sudo bash deploy/diagnose.sh
 | 所有人登录都返回 `429` | 60 秒内全局失败次数达到上限，可能正被分布式爆破 | 最多等 1 分钟自动恢复；用 `journalctl -u server-monitor \| grep '\[安全\]'` 确认来源 |
 
 应急时可 `systemctl restart server-monitor` 立即清空退避状态（退避记录只在内存中）。
+
+### 11.5 安装命令报 `/dev/fd/63: No such file or directory`
+
+现象（`sudo` 挡住了进程替换的 fd）：
+
+```
+$ sudo bash <(curl -fsSL https://raw.githubusercontent.com/zeisscai/server-monitor/main/install.sh)
+bash: /dev/fd/63: No such file or directory
+bash: line 1: curl: (23) Failure writing output to destination
+```
+
+**原因**：`<(curl ...)` 是**进程替换**，curl 的输出挂在当前 shell 的一个高位文件描述符上
+（通常就是 63），bash 拿到的只是 `/dev/fd/63` 这个"路径"。而 `sudo` 是 setuid 程序，
+出于安全默认关闭继承的、编号 ≥ 3 的文件描述符（除非 `/etc/sudoers` 里开了
+`closefrom_override`）。于是 sudo 拉起的 bash 打不开那个 fd；读端消失后，
+curl 往管道里写就失败，返回 `23`。
+
+这与脚本内容、网络、GitHub 访问都无关——**脚本根本没开始执行**。
+
+**处理**（脚本自己会调 sudo，通常根本不需要写 `sudo`）：
+
+| 写法 | 说明 |
+| --- | --- |
+| `bash <(curl -fsSL <URL>)` | **推荐**，普通用户执行，脚本内部提权 |
+| `curl -fsSL <URL> \| sudo bash` | 想显式提权时用；stdin 是管道而非 fd，不受影响 |
+| `curl -fsSL <URL> -o install.sh && sudo bash install.sh` | 先落地再执行，最适合需要断点续传/审计的场合 |
+
+> 极少数精简系统没有 `/dev/fd`，此时只能选后两种。
 
 ---
 

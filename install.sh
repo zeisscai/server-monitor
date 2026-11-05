@@ -940,14 +940,26 @@ install / upgrade 参数：
   --version V    指定版本        --yes          使用默认值，不再确认
 
 示例：
-  # 一行安装（推荐）
+  # 一行安装（推荐，普通用户执行，脚本内部会自己调 sudo）
   bash <(curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh)
 
   # 国内网络 + 静默安装
   SMD_MIRROR=https://ghfast.top/ bash <(curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh) install --yes --port 8080
 
+  # 先下载再执行（需要 sudo 时用这种，或 curl ... | sudo bash）
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh -o install.sh
+  sudo bash install.sh
+
   # 离线：先上传二进制，再执行
   bash install.sh install --bin ./server-monitor-linux-amd64
+
+注意：
+  不要写成 "sudo bash <(curl ...)"。sudo 默认会关闭继承的文件描述符，
+  bash 在新进程里打不开 /dev/fd/63，会报：
+      bash: /dev/fd/63: No such file or directory
+      curl: (23) Failure writing output to destination
+  这不是网络或脚本的问题，换成上面的写法即可。本脚本检测到非 root 时会自动提权，
+  因此正常情况下不需要手动加 sudo。
 EOF
 }
 
