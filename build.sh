@@ -57,12 +57,25 @@ for t in "${targets[@]}"; do
   names+=("${name}")
 done
 
-# 编译产物直接跑一次 version，确认 ldflags 注入生效（防止发出去的包版本号是旧的）。
-built="$("${OUT_DIR}/server-monitor-linux-amd64" version 2>/dev/null || true)"
-case "$built" in
-  *"v${VERSION}") echo "==> 版本校验通过：${built}" ;;
-  *) echo "警告：产物版本号与预期不符（期望 v${VERSION}，实际 ${built:-读取失败}）" >&2 ;;
+# 用「与构建机同平台」的产物跑一次 version，确认 ldflags 注入生效。
+# 不能直接跑 linux 产物：在 macOS 上构建时那些文件无法执行。
+host_os="$(uname -s | tr 'A-Z' 'a-z')"
+host_arch="$(uname -m)"
+case "$host_arch" in
+  x86_64|amd64)  host_arch="amd64" ;;
+  aarch64|arm64) host_arch="arm64" ;;
+  armv7l|armv7)  host_arch="arm" ;;
 esac
+probe="${OUT_DIR}/server-monitor-${host_os}-${host_arch}"
+if [ -x "$probe" ]; then
+  built="$("$probe" version 2>/dev/null || true)"
+  case "$built" in
+    *"v${VERSION}") echo "==> 版本校验通过：${built}" ;;
+    *) echo "警告：产物版本号与预期不符（期望 v${VERSION}，实际 ${built:-读取失败}）" >&2 ;;
+  esac
+else
+  echo "==> 跳过版本校验（构建机上没有 ${host_os}/${host_arch} 产物）"
+fi
 
 # 校验和：Linux 用 sha256sum，macOS 只有 shasum。
 (
