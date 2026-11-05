@@ -15,14 +15,22 @@
 | 项 | 值 |
 | --- | --- |
 | 方法 | `GET`（`HEAD` 亦可，仅用于探测可用性，无响应体） |
-| 地址 | `http://<面板服务器IP>:<数据接收端口>/api/servers`，端口默认 `9100` |
+| 地址 | `http://<面板服务器IP>:<Web 端口>/api/servers`，端口默认 `8080`（与面板同一端口） |
 | 协议 | **仅 HTTP**，本系统不提供 HTTPS，请勿按 HTTPS 连接 |
 | 参数 | 无。不支持分页、过滤、时间范围；一次返回全部服务器 |
 | 请求体 | 无 |
 
 ```bash
-curl -s -H 'X-API-Key: <查询 API-Key>' http://192.168.1.10:9100/api/servers
+curl -s -H 'X-API-Key: <查询 API-Key>' http://192.168.1.10:8080/api/servers
 ```
+
+> **端口说明**：接口默认与面板（Web 界面）同一端口，调用方只需要放行这一个端口，
+> 也无须另外记忆端口号。若该面板同时开启了「数据接收」，数据接收端口（默认 9100）上
+> 有一份**完全相同**的接口，供只放行数据端口的采集网环境使用；两个地址返回内容一致，
+> 用哪个都行。开启查询 API 本身**不会**新开任何端口。
+>
+> 面板若挂在 HTTPS 反向代理之后，把上面的 `http://` 换成 `https://` 并去掉端口即可，
+> 证书由代理负责。
 
 ### 1.2 鉴权
 
@@ -218,7 +226,7 @@ Python（标准库，无第三方依赖）：
 ```python
 import json, time, urllib.request
 
-def fetch(host, key, port=9100, timeout=10):
+def fetch(host, key, port=8080, timeout=10):
     req = urllib.request.Request(
         f"http://{host}:{port}/api/servers",
         headers={"X-API-Key": key},
@@ -243,7 +251,7 @@ for s in data.get("servers", []):
 Shell + jq：
 
 ```bash
-curl -s -H "X-API-Key: $KEY" http://192.168.1.10:9100/api/servers \
+curl -s -H "X-API-Key: $KEY" http://192.168.1.10:8080/api/servers \
   | jq -r '.servers[] | [.uuid, .name, (.cpu|tostring), (.mem|tostring),
            (if (.os // "") == "" then "未知" else .os end), (.uptime|tostring)] | @tsv'
 ```
